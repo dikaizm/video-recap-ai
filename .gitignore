@@ -2,4 +2,7 @@ venv/
 .env
 **/__pycache__/
 remotion/node_modules/
+remotion/public/video.mp4
+remotion/public/voiceover/
 output/
+.claude/

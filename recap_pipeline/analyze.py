@@ -1,38 +1,41 @@
 """
-Video scene analyzer using Gemma 4 E4B (4-bit quantized) + speech transcription.
+Video scene analyzer using Ollama VLM + speech transcription.
 
 Pipeline:
   1. Extract audio from video → transcribe with faster-whisper or whisperx
   2. Extract video frames at a fixed interval
-  3. For each analysis window, inject matching dialogue + frames into Gemma 3n E4B
+  3. For each analysis window, send frames + dialogue to Ollama VLM
   4. Output per-scene descriptions with timestamps and spoken dialogue
 
 Usage:
     python analyze.py --video /path/to/video.mp4
+    python analyze.py --video /path/to/video.mp4 --ollama-model gemma4:e2b
     python analyze.py --video /path/to/video.mp4 --transcriber whisperx
-    python analyze.py --video /path/to/video.mp4 --transcriber faster-whisper --whisper-model medium
     python analyze.py --video /path/to/video.mp4 --no-audio
     python analyze.py --video /path/to/video.mp4 --context "Sci-fi short film..."
     python analyze.py --video /path/to/video.mp4 --interval 5 --window 8 --overlap 2
 """
 
 import argparse
+import base64
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
 
 import av
-import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 
-VLM_MODEL_ID = "google/gemma-4-E4B"
+OLLAMA_DEFAULT_MODEL = "gemma4:e2b"
+OLLAMA_DEFAULT_HOST = "http://localhost:11434"
 
 SYSTEM_PROMPT = """\
 You are a video analyst. Look carefully at the frames provided and answer only what you can directly observe.
@@ -53,15 +56,69 @@ EMOTION: [the dominant human emotion in this scene — fear, grief, tension, rel
 
 
 # ---------------------------------------------------------------------------
-# Device
+# Ollama client
 # ---------------------------------------------------------------------------
 
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+def ollama_generate(
+    prompt: str,
+    images: list[str],  # base64-encoded PNG strings
+    model: str = OLLAMA_DEFAULT_MODEL,
+    host: str = OLLAMA_DEFAULT_HOST,
+    retries: int = 3,
+) -> str:
+    payload = json.dumps({
+        "model": model,
+        "system": SYSTEM_PROMPT,
+        "prompt": prompt,
+        "images": images,
+        "stream": False,
+        "options": {"temperature": 0, "num_predict": 400},
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{host}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read())
+                return result["response"].strip()
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"  [ollama] connection error, retrying in {wait}s: {e}")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Ollama unreachable at {host}: {e}") from e
+
+
+def check_ollama(model: str, host: str) -> None:
+    """Verify Ollama is running and the model is available."""
+    try:
+        with urllib.request.urlopen(f"{host}/api/tags", timeout=5) as resp:
+            data = json.loads(resp.read())
+        names = [m["name"] for m in data.get("models", [])]
+        # Match with or without tag suffix
+        base = model.split(":")[0]
+        if not any(n == model or n.startswith(base + ":") for n in names):
+            print(f"  [warn] model '{model}' not found in Ollama. Available: {names}")
+            print(f"  Run: ollama pull {model}")
+    except Exception as e:
+        raise RuntimeError(f"Ollama not reachable at {host} — is it running? ({e})") from e
+
+
+def image_to_base64(img: Image.Image, max_size: int = 672) -> str:
+    """Resize image to max_size on longest edge and encode as base64 PNG."""
+    w, h = img.size
+    if max(w, h) > max_size:
+        scale = max_size / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +126,6 @@ def get_device() -> torch.device:
 # ---------------------------------------------------------------------------
 
 def extract_audio(video_path: str, out_wav: str) -> None:
-    """Extract audio track from video to a mono 16 kHz WAV (Whisper's required format)."""
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
         "-ac", "1", "-ar", "16000",
@@ -82,7 +138,6 @@ def extract_audio(video_path: str, out_wav: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Transcription backends
-# Normalised output: list of {start, end, text, words: [{start, end, word}]}
 # ---------------------------------------------------------------------------
 
 def transcribe_faster_whisper(
@@ -90,7 +145,6 @@ def transcribe_faster_whisper(
 ) -> list[dict]:
     from faster_whisper import WhisperModel
 
-    # CTranslate2 has no MPS support — CPU int8 is fast enough for one-shot transcription
     whisper = WhisperModel(model_size, device="cpu", compute_type="int8")
 
     kwargs: dict = {"beam_size": 5, "word_timestamps": True}
@@ -114,7 +168,6 @@ def transcribe_whisperx(
 ) -> list[dict]:
     import whisperx
 
-    # WhisperX also has no MPS support — use CPU
     device = "cpu"
     compute_type = "int8"
 
@@ -127,7 +180,6 @@ def transcribe_whisperx(
     detected_lang = result.get("language", language or "unknown")
     print(f"  Detected language : {detected_lang}")
 
-    # Forced alignment for word-level timestamps
     print("  Running forced alignment...")
     align_model, metadata = whisperx.load_align_model(
         language_code=detected_lang, device=device
@@ -137,7 +189,6 @@ def transcribe_whisperx(
         return_char_alignments=False,
     )
 
-    # Normalise to the same structure as faster-whisper output
     segments = []
     for seg in result["segments"]:
         words = [{"start": w["start"], "end": w["end"], "word": w["word"]}
@@ -148,10 +199,7 @@ def transcribe_whisperx(
 
 
 def transcribe(
-    audio_path: str,
-    backend: str,
-    model_size: str,
-    language: str | None,
+    audio_path: str, backend: str, model_size: str, language: str | None,
 ) -> list[dict]:
     if backend == "whisperx":
         return transcribe_whisperx(audio_path, model_size, language)
@@ -178,11 +226,8 @@ def get_dialogue_for_window(
 # ---------------------------------------------------------------------------
 
 def extract_frames(
-    video_path: str, interval_sec: float, max_size: int = 672
+    video_path: str, interval_sec: float
 ) -> list[tuple[float, Image.Image]]:
-    """Extract frames and downscale to max_size on the longest edge.
-    MPS has a 4 GB tensor limit — keeping frames small avoids OOM kills.
-    """
     frames = []
     container = av.open(video_path)
     stream = container.streams.video[0]
@@ -193,10 +238,6 @@ def extract_frames(
         if i % interval_frames == 0:
             ts = float(frame.pts * stream.time_base)
             img = frame.to_image()
-            w, h = img.size
-            if max(w, h) > max_size:
-                scale = max_size / max(w, h)
-                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
             frames.append((ts, img))
 
     container.close()
@@ -226,6 +267,8 @@ def build_user_prompt(
     parts = []
     if prev_scene:
         parts.append(f"Story context from preceding scenes:\n{prev_scene}\n")
+    if context:
+        parts.append(f"Video context: {context}\n")
     parts.append(f"These {n_frames} frames are from {start_fmt} to {end_fmt}.")
     if dialogue:
         parts.append(f"Dialogue spoken:\n{dialogue}")
@@ -247,58 +290,24 @@ def extract_prev_scene_summary(description: str, max_chars: int = 300) -> str:
 
 
 # ---------------------------------------------------------------------------
-# VLM inference
+# VLM inference via Ollama
 # ---------------------------------------------------------------------------
 
 def analyze_window(
-    processor,
-    model,
-    device: torch.device,
     frames: list[Image.Image],
     start_ts: float,
     end_ts: float,
+    model: str = OLLAMA_DEFAULT_MODEL,
+    host: str = OLLAMA_DEFAULT_HOST,
     dialogue: str = "",
     context: str | None = None,
     prev_scene: str | None = None,
-    max_new_tokens: int = 400,
 ) -> str:
     start_fmt = format_timestamp(start_ts)
     end_fmt = format_timestamp(end_ts)
-    user_text = build_user_prompt(
-        start_fmt, end_fmt, len(frames), dialogue, context, prev_scene
-    )
-
-    # Build content list: interleave images and text in the format expected by Gemma 3n
-    content: list[dict] = []
-    for img in frames:
-        content.append({"type": "image", "image": img})
-    content.append({"type": "text", "text": SYSTEM_PROMPT + "\n\n" + user_text})
-
-    messages = [{"role": "user", "content": content}]
-
-    # apply_chat_template returns text; processor handles image injection
-    prompt_text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs = processor(
-        text=prompt_text,
-        images=frames if frames else None,
-        return_tensors="pt",
-    )
-    # With device_map="auto" the model manages its own device placement
-    inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
-
-    with torch.inference_mode():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            repetition_penalty=1.2,
-        )
-
-    input_len = inputs["input_ids"].shape[1]
-    generated = output_ids[0][input_len:]
-    return processor.decode(generated, skip_special_tokens=True).strip()
+    prompt = build_user_prompt(start_fmt, end_fmt, len(frames), dialogue, context, prev_scene)
+    images_b64 = [image_to_base64(img) for img in frames]
+    return ollama_generate(prompt, images_b64, model=model, host=host)
 
 
 # ---------------------------------------------------------------------------
@@ -307,9 +316,15 @@ def analyze_window(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze a video with SmolVLM2 + speech transcription"
+        description="Analyze a video with Ollama VLM + speech transcription"
     )
     parser.add_argument("--video", required=True, help="Path to input video file")
+
+    # Ollama args
+    parser.add_argument("--ollama-model", default=OLLAMA_DEFAULT_MODEL,
+                        help=f"Ollama model name (default: {OLLAMA_DEFAULT_MODEL})")
+    parser.add_argument("--ollama-host", default=OLLAMA_DEFAULT_HOST,
+                        help=f"Ollama host URL (default: {OLLAMA_DEFAULT_HOST})")
 
     # Vision args
     parser.add_argument("--interval", type=float, default=5.0,
@@ -318,8 +333,6 @@ def main():
                         help="Frames per analysis window (default: 4)")
     parser.add_argument("--overlap", type=int, default=1,
                         help="Frame overlap between windows (default: 1)")
-    parser.add_argument("--max-tokens", type=int, default=150,
-                        help="Max new tokens per scene description (default: 150)")
     parser.add_argument("--context", default=None,
                         help="Background context about the video (characters, genre, etc.)")
     parser.add_argument("--no-continuity", action="store_true",
@@ -353,17 +366,20 @@ def main():
     transcript_path = output_path.with_name(output_path.stem + "_transcript.json")
 
     pipeline_start = time.time()
-    device = get_device()
     transcriber_label = "none" if args.no_audio else f"{args.transcriber} ({args.whisper_model})"
-    print(f"Device:       {device}")
-    print(f"VLM:          {VLM_MODEL_ID}")
+    print(f"VLM:          {args.ollama_model} (Ollama)")
+    print(f"Ollama host:  {args.ollama_host}")
     print(f"Transcriber:  {transcriber_label}")
     print(f"Video:        {video_path.name}")
-    print(f"Params:       interval={args.interval}s  window={args.window}  "
-          f"overlap={args.overlap}  max_tokens={args.max_tokens}")
+    print(f"Params:       interval={args.interval}s  window={args.window}  overlap={args.overlap}")
     if args.context:
         print(f"Context:      {args.context[:80]}{'...' if len(args.context) > 80 else ''}")
     print()
+
+    # Verify Ollama is reachable before doing the heavy work
+    print("Checking Ollama...")
+    check_ollama(args.ollama_model, args.ollama_host)
+    print("  → Ollama ready\n")
 
     # ------------------------------------------------------------------
     # Step 1: Transcribe audio
@@ -405,47 +421,19 @@ def main():
     print(f"  → {len(windows)} analysis windows\n")
 
     # ------------------------------------------------------------------
-    # Step 3: VLM analysis
+    # Step 3: VLM analysis via Ollama
     # ------------------------------------------------------------------
-    print("Step 3/3 — Loading VLM...")
-    processor = AutoProcessor.from_pretrained(VLM_MODEL_ID)
-
-    # 4-bit quantization via bitsandbytes (requires CUDA or CPU; MPS falls back to float16)
-    use_4bit = device.type in ("cuda", "cpu")
-    if use_4bit:
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-        model = AutoModelForImageTextToText.from_pretrained(
-            VLM_MODEL_ID,
-            quantization_config=quant_config,
-            device_map="auto",
-        )
-        print("  → 4-bit NF4 quantization enabled")
-    else:
-        # MPS (Apple Silicon) — bitsandbytes 4-bit not supported; use float16
-        model = AutoModelForImageTextToText.from_pretrained(
-            VLM_MODEL_ID,
-            torch_dtype=torch.float16,
-            device_map="auto",
-        )
-        print(f"  → float16 (4-bit not available on {device.type})")
-
-    model.eval()
-    print("  → Model ready\n")
+    print(f"Step 3/3 — Analyzing {len(windows)} windows with {args.ollama_model}...")
 
     results = []
-    prev_scene_history: list[str] = []  # rolling buffer of last 3 scene summaries
+    prev_scene_history: list[str] = []
 
     for idx, (start_ts, end_ts, window_frames) in enumerate(windows):
         start_fmt = format_timestamp(start_ts)
         end_fmt = format_timestamp(end_ts)
         dialogue = get_dialogue_for_window(segments, start_ts, end_ts) if segments else ""
 
-        print(f"[{idx+1:02d}/{len(windows)}] {start_fmt} → {end_fmt}  ({len(window_frames)} frames)")
+        print(f"[{idx+1:02d}/{len(windows)}] {start_fmt} → {end_fmt}  ({len(window_frames)} frames)", flush=True)
         if dialogue:
             preview = dialogue.replace("\n", " ")
             print(f"  Dialogue: {preview[:120]}{'...' if len(preview) > 120 else ''}")
@@ -455,26 +443,26 @@ def main():
             prev_context = "\n".join(prev_scene_history[-3:])
 
         description = analyze_window(
-            processor=processor,
-            model=model,
-            device=model.device,
             frames=window_frames,
             start_ts=start_ts,
             end_ts=end_ts,
+            model=args.ollama_model,
+            host=args.ollama_host,
             dialogue=dialogue,
             context=args.context,
             prev_scene=prev_context,
-            max_new_tokens=args.max_tokens,
         )
 
         is_credits = "CREDITS: true" in description.upper().replace(" ", "").replace(":", ":")
 
         if is_credits:
-            print(f"  → credits/title detected, skipping scene\n")
-        elif not args.no_continuity:
-            prev_scene_history.append(extract_prev_scene_summary(description))
-            if len(prev_scene_history) > 3:
-                prev_scene_history.pop(0)
+            print(f"  → credits/title detected, skipping\n")
+        else:
+            if not args.no_continuity:
+                prev_scene_history.append(extract_prev_scene_summary(description))
+                if len(prev_scene_history) > 3:
+                    prev_scene_history.pop(0)
+            print(f"  {description[:200]}{'...' if len(description) > 200 else ''}\n")
 
         entry = {
             "window": idx + 1,
@@ -488,13 +476,13 @@ def main():
             "description": description,
         }
         results.append(entry)
-        print(f"  {description[:200]}{'...' if len(description) > 200 else ''}\n")
 
     processing_sec = round(time.time() - pipeline_start, 1)
     output = {
         "video": str(video_path),
-        "vlm_model": VLM_MODEL_ID,
-        "device": str(device),
+        "vlm_model": args.ollama_model,
+        "vlm_backend": "ollama",
+        "ollama_host": args.ollama_host,
         "transcriber": None if args.no_audio else args.transcriber,
         "whisper_model": None if args.no_audio else args.whisper_model,
         "interval_sec": args.interval,

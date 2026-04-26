@@ -1,20 +1,20 @@
 """
-orchestrate.py — Full pipeline: analyze → transform → (narrate) → (TTS) → Remotion render.
+main.py — Full pipeline: analyze → transform → (narrate) → (TTS) → Remotion render.
 
 Usage:
     # Full pipeline:
-    python orchestrate.py --video /path/to/movie.mp4
+    python recap_pipeline/main.py --video /path/to/movie.mp4
 
     # Skip analysis if JSON already exists:
-    python orchestrate.py --video /path/to/movie.mp4 \
-        --skip-analysis --analysis-json test_analysis.json
+    python recap_pipeline/main.py --video /path/to/movie.mp4 \
+        --skip-analysis --analysis-json output/<run>/analysis.json
 
     # With macOS TTS + DeepSeek narration:
-    python orchestrate.py --video /path/to/movie.mp4 \
-        --tts macos --narrate --deepseek-key sk_...
+    python recap_pipeline/main.py --video /path/to/movie.mp4 \
+        --tts macos --narrate
 
     # With ElevenLabs:
-    python orchestrate.py --video /path/to/movie.mp4 \
+    python recap_pipeline/main.py --video /path/to/movie.mp4 \
         --tts elevenlabs --elevenlabs-key sk_...
 """
 import argparse
@@ -28,14 +28,70 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+# Project root is one level up from this file (recap_pipeline/)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 REMOTION_DIR = os.path.join(PROJECT_ROOT, "remotion")
 OUTPUT_BASE = os.path.join(PROJECT_ROOT, "output")
+
+# Ensure sibling modules (analyze, transform, narrate, tts) are importable
+sys.path.insert(0, PACKAGE_DIR)
+
+# Load .env if present
+_env_path = os.path.join(PROJECT_ROOT, ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+_log_file = None  # set after run_dir is created
+
+
+class _Tee:
+    """Write to multiple sinks simultaneously (terminal + log file)."""
+    def __init__(self, *sinks):
+        self._sinks = sinks
+
+    def write(self, data):
+        for s in self._sinks:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self._sinks:
+            s.flush()
+
+    def fileno(self):
+        return self._sinks[0].fileno()
+
+
+def setup_run_logging(run_dir: str) -> None:
+    global _log_file
+    log_path = os.path.join(run_dir, "pipeline.log")
+    _log_file = open(log_path, "w", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, _log_file)
+    sys.stderr = _Tee(sys.__stderr__, _log_file)
+    print(f"[log] pipeline log → {log_path}", flush=True)
+
+
+def _stream_subprocess(cmd: list[str], **kwargs) -> None:
+    """Run subprocess and stream its stdout+stderr through Python (captures into log)."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs
+    )
+    assert proc.stdout
+    for raw in proc.stdout:
+        print(raw.decode(errors="replace"), end="", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
 def make_run_dir(video_path: str) -> str:
     stem = Path(video_path).stem
-    # Truncate long filenames; strip problematic chars
     safe_stem = "".join(c if c.isalnum() or c in "_-" else "_" for c in stem)[:40]
     suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(OUTPUT_BASE, f"{safe_stem}_{suffix}")
@@ -44,11 +100,12 @@ def make_run_dir(video_path: str) -> str:
 
 
 def run_analysis(video_path: str, output_json: str, extra_args: list[str] | None = None) -> str:
-    cmd = [sys.executable, "analyze.py", "--video", video_path, "--output", output_json]
+    analyze_script = os.path.join(PACKAGE_DIR, "analyze.py")
+    cmd = [sys.executable, "-u", analyze_script, "--video", video_path, "--output", output_json]
     if extra_args:
         cmd.extend(extra_args)
     print(f"[analyze] {' '.join(cmd)}")
-    subprocess.run(cmd, check=True, cwd=PROJECT_ROOT)
+    _stream_subprocess(cmd, cwd=PROJECT_ROOT)
     return output_json
 
 
@@ -62,9 +119,7 @@ def _link_or_copy(src: str, dest: str) -> None:
 
 
 def setup_remotion_public(video_path: str, voiceover_dir: str | None = None) -> None:
-    """Place the video (and optional voiceovers) in remotion/public/ for Remotion's static server.
-    Uses hard links (zero disk overhead) when on the same filesystem, else copies.
-    """
+    """Place the video (and optional voiceovers) in remotion/public/ for Remotion's static server."""
     public_dir = os.path.join(REMOTION_DIR, "public")
     os.makedirs(public_dir, exist_ok=True)
 
@@ -87,7 +142,6 @@ def setup_remotion_public(video_path: str, voiceover_dir: str | None = None) -> 
 
 
 def get_audio_duration(mp3_path: str) -> float | None:
-    """Return duration in seconds of an audio file using ffprobe. Returns None on failure."""
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return None
@@ -103,10 +157,8 @@ def get_audio_duration(mp3_path: str) -> float | None:
 
 
 def adjust_display_frames_to_audio(storyboard: dict, voiceover_dir: str, fps: int) -> dict:
-    """Expand each scene's displayFrames to fit the actual voiceover audio duration.
-    This prevents narration from being cut off mid-sentence.
-    """
-    padding_frames = round(0.4 * fps)  # 0.4s tail padding after narration ends
+    """Expand each scene's displayFrames to fit the actual voiceover audio duration."""
+    padding_frames = round(0.4 * fps)
     adjusted = 0
 
     for scene in storyboard["scenes"]:
@@ -161,13 +213,11 @@ def run_render(storyboard: dict, output_mp4: str, concurrency: int = 1) -> None:
 
     props_json = json.dumps({"storyboard": storyboard})
 
-    # Use a temp file for props if the JSON string is large (>4KB) to avoid shell arg limits
     if len(props_json) > 4_000:
         with tempfile.NamedTemporaryFile(
             suffix=".json", mode="w", delete=False, dir=REMOTION_DIR
         ) as tf:
             tf.write(props_json)
-            # Remotion --props accepts a file path as well as a JSON string
             props_arg = ["--props", tf.name]
             cleanup_props = tf.name
     else:
@@ -194,8 +244,10 @@ def run_render(storyboard: dict, output_mp4: str, concurrency: int = 1) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Movie recap pipeline orchestrator")
+    parser = argparse.ArgumentParser(description="Movie recap pipeline")
     parser.add_argument("--video", required=True, help="Input video file path")
+    parser.add_argument("--ollama-model", default="gemma4:e2b", help="Ollama model for VLM analysis")
+    parser.add_argument("--ollama-host", default="http://localhost:11434", help="Ollama host URL")
     parser.add_argument("--skip-analysis", action="store_true", help="Skip analysis step")
     parser.add_argument("--analysis-json", default=None, help="Existing analysis JSON (implies --skip-analysis)")
     parser.add_argument("--fps", type=int, default=30)
@@ -207,8 +259,9 @@ def main():
     parser.add_argument("--elevenlabs-key", default=None)
     parser.add_argument("--tts-voice", default="Samantha", help="macOS TTS voice name")
     parser.add_argument("--narrate", action="store_true", help="Synthesize narration via DeepSeek before TTS")
-    parser.add_argument("--deepseek-key", default=os.environ.get("DEEPSEEK_API_KEY"), help="DeepSeek API key for narration")
+    parser.add_argument("--deepseek-key", default=os.environ.get("DEEPSEEK_API_KEY"), help="DeepSeek API key (env: DEEPSEEK_API_KEY)")
     parser.add_argument("--narrate-force", action="store_true", help="Re-generate narration even if it exists")
+    parser.add_argument("--no-evaluate", action="store_true", help="Skip story coherence evaluation after narration")
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--output", default=None, help="Output MP4 path (default: output/<video>_<timestamp>/recap.mp4)")
     args = parser.parse_args()
@@ -216,8 +269,8 @@ def main():
     pipeline_start = time.time()
     os.makedirs(OUTPUT_BASE, exist_ok=True)
 
-    # Create unique run directory named after the video + timestamp
     run_dir = make_run_dir(args.video)
+    setup_run_logging(run_dir)
     print(f"[run] output directory: {run_dir}")
 
     output_mp4 = args.output or os.path.join(run_dir, "recap.mp4")
@@ -229,19 +282,21 @@ def main():
         analysis_json = args.analysis_json
         print(f"[analyze] using existing JSON: {analysis_json}")
     elif args.skip_analysis:
-        # Look for analysis in legacy output dirs
         candidates = [
             os.path.join(OUTPUT_BASE, "analysis.json"),
             os.path.join(OUTPUT_BASE, "shared", "analysis.json"),
         ]
         analysis_json = next((p for p in candidates if os.path.exists(p)), None)
         if not analysis_json:
-            print(f"[error] --skip-analysis set but no analysis.json found", file=sys.stderr)
+            print("[error] --skip-analysis set but no analysis.json found", file=sys.stderr)
             sys.exit(1)
         print(f"[analyze] using existing JSON: {analysis_json}")
     else:
         analysis_json = os.path.join(run_dir, "analysis.json")
-        run_analysis(args.video, analysis_json)
+        run_analysis(args.video, analysis_json, extra_args=[
+            "--ollama-model", args.ollama_model,
+            "--ollama-host", args.ollama_host,
+        ])
 
     # Step 2: Transform
     from transform import transform as do_transform
@@ -255,9 +310,8 @@ def main():
         voiceover_dir=voiceover_dir,
     )
 
-    # Step 3: Narration synthesis (optional, before TTS)
+    # Step 3: Narration (optional)
     narrated_storyboard_path = os.path.join(run_dir, "storyboard_narrated.json")
-    # Maps window -> {narratedText, importanceScore} for re-applying after re-transform
     narration_meta: dict[int, dict] = {}
 
     if args.narrate:
@@ -267,7 +321,7 @@ def main():
 
         from narrate import narrate as do_narrate
 
-        print("[narrate] synthesizing cinematic narration via DeepSeek...")
+        print("[narrate] synthesizing narration via DeepSeek...")
         storyboard = do_narrate(
             storyboard_path=storyboard_path,
             output_path=narrated_storyboard_path,
@@ -277,7 +331,27 @@ def main():
         )
         storyboard_path = narrated_storyboard_path
 
-        # Patch povText so TTS speaks the narrated text; save all narration fields for re-apply
+        for scene in storyboard["scenes"]:
+            if scene.get("narratedText"):
+                scene["povText"] = scene["narratedText"]
+            narration_meta[scene["window"]] = {
+                "narratedText": scene.get("narratedText", ""),
+                "importanceScore": scene.get("importanceScore"),
+            }
+
+    # Step 3b: Story coherence evaluation (optional, runs when --narrate is active)
+    if args.narrate and not args.no_evaluate:
+        from evaluate import evaluate as do_evaluate
+
+        evaluated_storyboard_path = os.path.join(run_dir, "storyboard_evaluated.json")
+        storyboard = do_evaluate(
+            storyboard_path=storyboard_path,
+            output_path=evaluated_storyboard_path,
+            api_key=args.deepseek_key,
+            force=args.narrate_force,
+        )
+        storyboard_path = evaluated_storyboard_path
+
         for scene in storyboard["scenes"]:
             if scene.get("narratedText"):
                 scene["povText"] = scene["narratedText"]
@@ -302,7 +376,6 @@ def main():
         print(f"[tts] generating voiceovers with backend={args.tts}...")
         generate_batch(storyboard["scenes"], voiceover_dir, args.tts, **tts_kwargs)
 
-        # Re-transform to pick up the generated voiceoverPath keys
         storyboard = do_transform(
             analysis_path=analysis_json,
             output_path=storyboard_path,
@@ -312,7 +385,6 @@ def main():
             voiceover_dir=voiceover_dir,
         )
 
-        # Re-apply all narration fields (re-transform overwrites them with raw analysis values)
         for scene in storyboard["scenes"]:
             meta = narration_meta.get(scene["window"])
             if meta:
@@ -322,10 +394,8 @@ def main():
                 if meta.get("importanceScore") is not None:
                     scene["importanceScore"] = meta["importanceScore"]
 
-        # Expand displayFrames so each scene lasts at least as long as its narration audio
         adjust_display_frames_to_audio(storyboard, voiceover_dir, args.fps)
 
-        # Persist final storyboard with corrected timing + narrated text
         with open(storyboard_path, "w") as f:
             json.dump(storyboard, f, indent=2)
 
@@ -342,7 +412,6 @@ def main():
 
     total_sec = round(time.time() - pipeline_start, 1)
 
-    # Load storyboard metadata for the log
     sb_meta = storyboard.get("metadata", {})
     run_log = {
         "timestamp": datetime.now().isoformat(),

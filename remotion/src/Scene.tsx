@@ -9,15 +9,12 @@ import {
   useVideoConfig,
 } from "remotion";
 import { type Scene } from "./schemas";
-import { TextOverlay } from "./TextOverlay";
 
 type Props = Scene & { videoSrc: string };
 
 export const SceneComponent: React.FC<Props> = ({
   startSec,
   displayFrames,
-  povText,
-  dialogue,
   voiceoverPath,
   videoSrc,
 }) => {
@@ -51,11 +48,6 @@ export const SceneComponent: React.FC<Props> = ({
           muted
         />
       </AbsoluteFill>
-
-      <TextOverlay
-        dialogue={dialogue || undefined}
-        displayFrames={displayFrames}
-      />
 
       {voiceoverPath && <Audio src={staticFile(voiceoverPath)} />}
     </AbsoluteFill>

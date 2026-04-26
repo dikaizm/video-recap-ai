@@ -2,7 +2,7 @@
 narrate.py — Two-pass narration: rank scene importance, then write calibrated voiceover.
 
 Pass 1 (batch): Score all scenes 1–5 for narrative importance in one API call.
-Pass 2 (per-scene): Write narration with word count scaled to importance + display duration.
+Pass 2 (per-scene): Write narration with word count scaled to importance.
 
 Usage:
     python narrate.py \
@@ -21,13 +21,13 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-chat"
 
 # Word count targets per importance score.
-# Always narrate — no silence. Lower scores get fewer words so visuals can breathe.
+# Floors are high enough that the model must add content beyond the raw povText.
 SCORE_WORD_TARGETS = {
     5: (20, 30),   # climax / key revelation — full narration
     4: (15, 22),   # significant story beat
     3: (12, 18),   # moderate — advances story but not pivotal
-    2: (8, 12),    # transition / establishing — brief observation
-    1: (6, 10),    # long atmospheric filler — one plain sentence
+    2: (10, 14),   # transition / establishing — brief observation
+    1: (10, 14),   # atmospheric filler — one expanded sentence
 }
 
 RANK_SYSTEM_PROMPT = """\
@@ -40,7 +40,8 @@ Score each movie scene 1–5 for narrative importance in a recap voiceover.
 1 = Atmospheric filler — long establishing shot, little story content
 
 Factor in the scene's position in the film (earlier scenes score lower than the same
-content near the climax).
+content near the climax). Discovery of a crash site, alien object, or mysterious voice
+should score 4–5 regardless of description quality.
 
 Return ONLY a JSON array of integers, one score per scene in the order given, nothing else.
 Example for 4 scenes: [3,5,2,4]\
@@ -57,14 +58,16 @@ You will receive:
 - Optional: dialogue snippets (from speech recognition — may be fragmented)
 - Optional: scene emotion (dominant feeling in the scene)
 - Importance score (1–5) and a target word count to guide narration density
-- Previous narration lines for continuity
+- Previous scenes with their visual descriptions and what was said, for continuity
 
 Your job: write narration that hits the target word count as closely as possible.
-For low-importance scenes, keep it brief — one plain sentence stating what is happening.
+For low-importance scenes, keep it brief but add story consequence or character state.
 For high-importance scenes, go deeper — what is at stake, what changes, what is felt.
 
 HARD RULES — no exceptions:
 - Hit the target word count (±3 words)
+- NEVER repeat or closely paraphrase the visual description — always reframe in terms of story consequence, character state, or what changes
+- When consecutive scenes show the same action (walking, exiting, credits rolling), each line must advance the story or shift perspective — never restate the same beat
 - No metaphors, poetic comparisons, or symbolic language
 - No abstract nouns as emotion carriers: "weight of", "ghost of", "cold witness", "thin comfort"
 - No "as [clause]" constructions that stack two ideas into one sentence
@@ -75,6 +78,11 @@ HARD RULES — no exceptions:
 
 Return ONLY the narration text. No labels, no quotes.\
 """
+
+
+def _word_overlap(a: str, b: str) -> float:
+    wa, wb = set(a.lower().split()), set(b.lower().split())
+    return len(wa & wb) / max(len(wa | wb), 1)
 
 
 def _http_post(api_key: str, messages: list[dict], max_tokens: int = 120,
@@ -139,13 +147,12 @@ def rank_scenes(scenes: list[dict], api_key: str, total_duration_sec: float) -> 
             {"role": "system", "content": RANK_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        max_tokens=max(128, len(scenes) * 4),  # compact array: ~3 chars per score
+        max_tokens=max(128, len(scenes) * 4),
         temperature=0.1,
     )
 
     print(f"  [rank] response: {raw[:120]}", flush=True)
     try:
-        # Strip markdown fences and any surrounding text; find the JSON array
         cleaned = raw.strip()
         start = cleaned.index("[")
         end = cleaned.rindex("]") + 1
@@ -163,19 +170,15 @@ def rank_scenes(scenes: list[dict], api_key: str, total_duration_sec: float) -> 
         return {s["window"]: 3 for s in scenes}
 
 
-def _word_target(score: int, display_secs: float) -> tuple[int, int]:
-    """Return (min_words, max_words) based on importance score and available display time."""
-    base_min, base_max = SCORE_WORD_TARGETS.get(score, (12, 18))
-    # Cap max by speaking pace (~2.3 words/sec) so narration never overruns the clip
-    time_cap = max(base_min, int(display_secs * 2.3))
-    return base_min, min(base_max, time_cap)
+def _word_target(score: int) -> tuple[int, int]:
+    return SCORE_WORD_TARGETS.get(score, (12, 18))
 
 
 def build_scene_prompt(
     scene: dict,
     analysis_scene: dict | None,
     score: int,
-    display_secs: float,
+    consecutive_hint: str = "",
 ) -> str:
     pov = scene.get("povText", "").strip()
     dialogue = scene.get("dialogue", "").strip()
@@ -186,7 +189,7 @@ def build_scene_prompt(
         if full_dialogue and len(full_dialogue) > len(dialogue):
             dialogue = full_dialogue
 
-    min_w, max_w = _word_target(score, display_secs)
+    min_w, max_w = _word_target(score)
     timestamp = scene.get("startFmt", "")
 
     parts = [
@@ -199,6 +202,8 @@ def build_scene_prompt(
         parts.append(f"Dialogue: {dialogue}")
     if emotion:
         parts.append(f"Emotion: {emotion}")
+    if consecutive_hint:
+        parts.append(consecutive_hint)
 
     return "\n".join(parts)
 
@@ -210,7 +215,6 @@ def narrate(
     analysis_path: str | None = None,
     force: bool = False,
 ) -> dict:
-    # If narrated output already exists and is complete, skip
     if not force and os.path.exists(output_path):
         with open(output_path) as f:
             storyboard = json.load(f)
@@ -233,7 +237,6 @@ def narrate(
     total = len(scenes)
     narrate_start = time.time()
 
-    # Compute total film duration from storyboard
     total_duration = max((s["endSec"] for s in scenes), default=1.0)
 
     # Pass 1: rank all scenes in one batch call
@@ -241,31 +244,42 @@ def narrate(
     score_dist = {i: sum(1 for v in scores.values() if v == i) for i in range(1, 6)}
     print(f"[narrate] score distribution: {score_dist}", flush=True)
 
-    # Store scores on scenes
     for scene in scenes:
         scene["importanceScore"] = scores.get(scene["window"], 3)
 
     # Pass 2: write narration per scene
-    narration_history: list[str] = [s["narratedText"] for s in scenes if s.get("narratedText")]
+    # History stores (povText, narratedText) so the model sees what was already described
+    narration_history: list[tuple[str, str]] = [
+        (s.get("povText", ""), s["narratedText"])
+        for s in scenes if s.get("narratedText")
+    ]
 
-    for scene in scenes:
+    for i, scene in enumerate(scenes):
         window = scene["window"]
         existing = scene.get("narratedText", "")
         if existing and not force:
             print(f"  skip scene {window:02d} (narration exists, score={scene['importanceScore']})")
-            if existing not in narration_history:
-                narration_history.append(existing)
+            if not any(nar == existing for _, nar in narration_history):
+                narration_history.append((scene.get("povText", ""), existing))
             continue
 
         score = scene["importanceScore"]
-        display_secs = scene.get("displayFrames", 45) / storyboard.get("fps", 30)
-        prompt = build_scene_prompt(scene, analysis_by_window.get(window), score, display_secs)
 
-        context = narration_history[-3:] if narration_history else None
+        # Detect consecutive similar scenes and add a hint
+        prev_pov = scenes[i - 1].get("povText", "") if i > 0 else ""
+        consecutive_hint = ""
+        if prev_pov and _word_overlap(scene.get("povText", ""), prev_pov) >= 0.6:
+            consecutive_hint = f"Note: previous scene already described \"{prev_pov[:60]}\". Advance the story — do not restate."
+
+        prompt = build_scene_prompt(
+            scene, analysis_by_window.get(window), score, consecutive_hint
+        )
+
         context_block = ""
-        if context:
-            context_block = "Previous narration (vary structure, do not echo):\n"
-            context_block += "\n".join(f"- {line}" for line in context)
+        if narration_history:
+            recent = narration_history[-3:]
+            context_block = "Previous scenes (visual description → narration said):\n"
+            context_block += "\n".join(f"- [{pov[:55]}] → {nar}" for pov, nar in recent)
             context_block += "\n\n"
 
         print(f"  narrate scene {window:02d}/{total} (score={score})...")
@@ -279,8 +293,22 @@ def narrate(
             temperature=0.5,
         )
 
+        # If output is too similar to povText, retry with explicit override
+        pov_text = scene.get("povText", "")
+        if pov_text and _word_overlap(narration, pov_text) >= 0.75:
+            print(f"    [retry] echo detected ({_word_overlap(narration, pov_text):.0%} overlap), regenerating...")
+            narration = _http_post(
+                api_key,
+                messages=[
+                    {"role": "system", "content": NARRATE_SYSTEM_PROMPT},
+                    {"role": "user", "content": "The visual description is already known to the audience. Write what this scene MEANS for the story — consequence, tension, or character state. Do not describe what is visible.\n\n" + prompt},
+                ],
+                max_tokens=80,
+                temperature=0.65,
+            )
+
         scene["narratedText"] = narration
-        narration_history.append(narration)
+        narration_history.append((pov_text, narration))
         wc = len(narration.split())
         print(f"    score={score} words={wc} → {narration[:80]}{'...' if len(narration) > 80 else ''}")
 
