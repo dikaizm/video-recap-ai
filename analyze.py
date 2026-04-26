@@ -1,10 +1,10 @@
 """
-Video scene analyzer using SmolVLM2-500M-Video-Instruct + speech transcription.
+Video scene analyzer using Gemma 4 E4B (4-bit quantized) + speech transcription.
 
 Pipeline:
   1. Extract audio from video → transcribe with faster-whisper or whisperx
   2. Extract video frames at a fixed interval
-  3. For each analysis window, inject matching dialogue + frames into SmolVLM2
+  3. For each analysis window, inject matching dialogue + frames into Gemma 3n E4B
   4. Output per-scene descriptions with timestamps and spoken dialogue
 
 Usage:
@@ -21,6 +21,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,23 +30,26 @@ load_dotenv()
 import av
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 
-VLM_MODEL_ID = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+VLM_MODEL_ID = "google/gemma-4-E4B"
 
 SYSTEM_PROMPT = """\
-You are a professional film analyst. You will be shown frames from a scene in a movie or video, \
-along with any dialogue spoken during that scene.
-Your task is to write a detailed scene description covering:
-- LOCATION: Where the scene takes place (interior/exterior, environment details)
-- CHARACTERS: Who is present, their appearance, expressions, and body language
-- ACTION: What is happening moment by moment
-- DIALOGUE: What is being said and what it reveals about the characters or plot
-- KEY OBJECTS: Any notable props, items, or elements that stand out
-- MOOD & TONE: The emotional atmosphere of the scene
-- STORY SIGNIFICANCE: How this scene advances the plot or reveals character
+You are a video analyst. Look carefully at the frames provided and answer only what you can directly observe.
+Do NOT invent details that are not visible. Do NOT write prose — use the exact structure below.
 
-Be specific and cinematic. Write in present tense."""
+IMPORTANT: If the frames show title cards, opening titles, closing credits, production logos, or end credits (scrolling text, cast lists, crew names), respond with exactly:
+CREDITS: true
+
+Otherwise describe the scene:
+
+LOCATION: [interior or exterior, describe the setting from the frames]
+CHARACTERS: [who is visible, their clothing, expressions, body language]
+ACTION: [what is literally happening in the frames]
+DIALOGUE: [only if dialogue is provided — what is said and by whom]
+KEY OBJECTS: [specific objects visible in the frames]
+MOOD: [the visual atmosphere — lighting, color, composition]
+EMOTION: [the dominant human emotion in this scene — fear, grief, tension, relief, anger, confusion, determination, isolation, etc. — infer from body language, expressions, and context even if faces are not clearly visible]"""
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +177,12 @@ def get_dialogue_for_window(
 # Frame extraction
 # ---------------------------------------------------------------------------
 
-def extract_frames(video_path: str, interval_sec: float) -> list[tuple[float, Image.Image]]:
+def extract_frames(
+    video_path: str, interval_sec: float, max_size: int = 672
+) -> list[tuple[float, Image.Image]]:
+    """Extract frames and downscale to max_size on the longest edge.
+    MPS has a 4 GB tensor limit — keeping frames small avoids OOM kills.
+    """
     frames = []
     container = av.open(video_path)
     stream = container.streams.video[0]
@@ -183,7 +192,12 @@ def extract_frames(video_path: str, interval_sec: float) -> list[tuple[float, Im
     for i, frame in enumerate(container.decode(stream)):
         if i % interval_frames == 0:
             ts = float(frame.pts * stream.time_base)
-            frames.append((ts, frame.to_image()))
+            img = frame.to_image()
+            w, h = img.size
+            if max(w, h) > max_size:
+                scale = max_size / max(w, h)
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            frames.append((ts, img))
 
     container.close()
     return frames
@@ -209,25 +223,16 @@ def build_user_prompt(
     context: str | None,
     prev_scene: str | None,
 ) -> str:
-    parts = [
-        f"The following {n_frames} frames span from {start_fmt} to {end_fmt} in the video.",
-    ]
-    if context:
-        parts.append(f"Background context: {context.strip()}")
+    parts = []
     if prev_scene:
-        parts.append(
-            f"Previous scene summary: {prev_scene.strip()}\n"
-            "Use this to maintain narrative continuity."
-        )
+        parts.append(f"Story context from preceding scenes:\n{prev_scene}\n")
+    parts.append(f"These {n_frames} frames are from {start_fmt} to {end_fmt}.")
     if dialogue:
-        parts.append(f"Dialogue spoken during this scene:\n{dialogue}")
+        parts.append(f"Dialogue spoken:\n{dialogue}")
     else:
-        parts.append("No dialogue was detected during this scene.")
-    parts.append(
-        "Now analyze the frames and write a detailed scene description using the structure: "
-        "LOCATION, CHARACTERS, ACTION, DIALOGUE, KEY OBJECTS, MOOD & TONE, STORY SIGNIFICANCE."
-    )
-    return "\n\n".join(parts)
+        parts.append("No dialogue.")
+    parts.append("Describe only what you can see in the frames using the structure above.")
+    return "\n".join(parts)
 
 
 def extract_prev_scene_summary(description: str, max_chars: int = 300) -> str:
@@ -263,19 +268,25 @@ def analyze_window(
         start_fmt, end_fmt, len(frames), dialogue, context, prev_scene
     )
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": SYSTEM_PROMPT},
-                *[{"type": "image"} for _ in frames],
-                {"type": "text", "text": user_text},
-            ],
-        }
-    ]
+    # Build content list: interleave images and text in the format expected by Gemma 3n
+    content: list[dict] = []
+    for img in frames:
+        content.append({"type": "image", "image": img})
+    content.append({"type": "text", "text": SYSTEM_PROMPT + "\n\n" + user_text})
 
-    prompt_text = processor.apply_chat_template(messages, add_generation_prompt=True)
-    inputs = processor(text=prompt_text, images=frames, return_tensors="pt").to(device)
+    messages = [{"role": "user", "content": content}]
+
+    # apply_chat_template returns text; processor handles image injection
+    prompt_text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = processor(
+        text=prompt_text,
+        images=frames if frames else None,
+        return_tensors="pt",
+    )
+    # With device_map="auto" the model manages its own device placement
+    inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
     with torch.inference_mode():
         output_ids = model.generate(
@@ -303,12 +314,12 @@ def main():
     # Vision args
     parser.add_argument("--interval", type=float, default=5.0,
                         help="Frame sampling interval in seconds (default: 5)")
-    parser.add_argument("--window", type=int, default=8,
-                        help="Frames per analysis window (default: 8)")
-    parser.add_argument("--overlap", type=int, default=2,
-                        help="Frame overlap between windows (default: 2)")
-    parser.add_argument("--max-tokens", type=int, default=400,
-                        help="Max new tokens per scene description (default: 400)")
+    parser.add_argument("--window", type=int, default=4,
+                        help="Frames per analysis window (default: 4)")
+    parser.add_argument("--overlap", type=int, default=1,
+                        help="Frame overlap between windows (default: 1)")
+    parser.add_argument("--max-tokens", type=int, default=150,
+                        help="Max new tokens per scene description (default: 150)")
     parser.add_argument("--context", default=None,
                         help="Background context about the video (characters, genre, etc.)")
     parser.add_argument("--no-continuity", action="store_true",
@@ -341,6 +352,7 @@ def main():
     )
     transcript_path = output_path.with_name(output_path.stem + "_transcript.json")
 
+    pipeline_start = time.time()
     device = get_device()
     transcriber_label = "none" if args.no_audio else f"{args.transcriber} ({args.whisper_model})"
     print(f"Device:       {device}")
@@ -397,15 +409,36 @@ def main():
     # ------------------------------------------------------------------
     print("Step 3/3 — Loading VLM...")
     processor = AutoProcessor.from_pretrained(VLM_MODEL_ID)
-    model = AutoModelForImageTextToText.from_pretrained(
-        VLM_MODEL_ID,
-        dtype=torch.float16 if device.type != "cpu" else torch.float32,
-    ).to(device)
+
+    # 4-bit quantization via bitsandbytes (requires CUDA or CPU; MPS falls back to float16)
+    use_4bit = device.type in ("cuda", "cpu")
+    if use_4bit:
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        model = AutoModelForImageTextToText.from_pretrained(
+            VLM_MODEL_ID,
+            quantization_config=quant_config,
+            device_map="auto",
+        )
+        print("  → 4-bit NF4 quantization enabled")
+    else:
+        # MPS (Apple Silicon) — bitsandbytes 4-bit not supported; use float16
+        model = AutoModelForImageTextToText.from_pretrained(
+            VLM_MODEL_ID,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        print(f"  → float16 (4-bit not available on {device.type})")
+
     model.eval()
     print("  → Model ready\n")
 
     results = []
-    prev_scene: str | None = None
+    prev_scene_history: list[str] = []  # rolling buffer of last 3 scene summaries
 
     for idx, (start_ts, end_ts, window_frames) in enumerate(windows):
         start_fmt = format_timestamp(start_ts)
@@ -417,21 +450,31 @@ def main():
             preview = dialogue.replace("\n", " ")
             print(f"  Dialogue: {preview[:120]}{'...' if len(preview) > 120 else ''}")
 
+        prev_context: str | None = None
+        if not args.no_continuity and prev_scene_history:
+            prev_context = "\n".join(prev_scene_history[-3:])
+
         description = analyze_window(
             processor=processor,
             model=model,
-            device=device,
+            device=model.device,
             frames=window_frames,
             start_ts=start_ts,
             end_ts=end_ts,
             dialogue=dialogue,
             context=args.context,
-            prev_scene=None if args.no_continuity else prev_scene,
+            prev_scene=prev_context,
             max_new_tokens=args.max_tokens,
         )
 
-        if not args.no_continuity:
-            prev_scene = extract_prev_scene_summary(description)
+        is_credits = "CREDITS: true" in description.upper().replace(" ", "").replace(":", ":")
+
+        if is_credits:
+            print(f"  → credits/title detected, skipping scene\n")
+        elif not args.no_continuity:
+            prev_scene_history.append(extract_prev_scene_summary(description))
+            if len(prev_scene_history) > 3:
+                prev_scene_history.pop(0)
 
         entry = {
             "window": idx + 1,
@@ -440,15 +483,18 @@ def main():
             "start_fmt": start_fmt,
             "end_fmt": end_fmt,
             "frame_count": len(window_frames),
+            "is_credits": is_credits,
             "dialogue": dialogue,
             "description": description,
         }
         results.append(entry)
         print(f"  {description[:200]}{'...' if len(description) > 200 else ''}\n")
 
+    processing_sec = round(time.time() - pipeline_start, 1)
     output = {
         "video": str(video_path),
         "vlm_model": VLM_MODEL_ID,
+        "device": str(device),
         "transcriber": None if args.no_audio else args.transcriber,
         "whisper_model": None if args.no_audio else args.whisper_model,
         "interval_sec": args.interval,
@@ -456,6 +502,7 @@ def main():
         "overlap": args.overlap,
         "context": args.context,
         "total_windows": len(results),
+        "processing_sec": processing_sec,
         "scenes": results,
     }
 

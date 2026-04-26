@@ -1,2 +1,5 @@
 venv/
 .env
+**/__pycache__/
+remotion/node_modules/
+output/

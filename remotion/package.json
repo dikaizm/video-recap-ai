@@ -1,0 +1,24 @@
+{
+  "name": "movie-recap",
+  "version": "1.0.0",
+  "description": "Remotion movie recap renderer",
+  "scripts": {
+    "start": "remotion studio",
+    "render": "remotion render"
+  },
+  "dependencies": {
+    "@remotion/bundler": "4.0.451",
+    "@remotion/cli": "4.0.451",
+    "@remotion/media-utils": "4.0.451",
+    "@remotion/renderer": "4.0.451",
+    "remotion": "4.0.451",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.20",
+    "@types/react-dom": "18.3.5",
+    "typescript": "5.8.3"
+  }
+}
