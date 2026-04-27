@@ -2,19 +2,24 @@
 main.py — Full pipeline: analyze → transform → (narrate) → (TTS) → Remotion render.
 
 Usage:
-    # Full pipeline:
+    # Folder-based input (recommended):
+    python recap_pipeline/main.py --input input/crash_site/
+    #   expects: input/crash_site/video.{mp4,mkv,...}  (required)
+    #            input/crash_site/story.{md,txt}        (optional)
+
+    # Legacy: explicit video path:
     python recap_pipeline/main.py --video /path/to/movie.mp4
 
     # Skip analysis if JSON already exists:
-    python recap_pipeline/main.py --video /path/to/movie.mp4 \
+    python recap_pipeline/main.py --input input/crash_site/ \
         --skip-analysis --analysis-json output/<run>/analysis.json
 
     # With macOS TTS + DeepSeek narration:
-    python recap_pipeline/main.py --video /path/to/movie.mp4 \
+    python recap_pipeline/main.py --input input/crash_site/ \
         --tts macos --narrate
 
     # With ElevenLabs:
-    python recap_pipeline/main.py --video /path/to/movie.mp4 \
+    python recap_pipeline/main.py --input input/crash_site/ \
         --tts elevenlabs --elevenlabs-key sk_...
 """
 import argparse
@@ -90,11 +95,50 @@ def _stream_subprocess(cmd: list[str], **kwargs) -> None:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
-def make_run_dir(video_path: str) -> str:
-    stem = Path(video_path).stem
-    safe_stem = "".join(c if c.isalnum() or c in "_-" else "_" for c in stem)[:40]
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv"}
+
+
+def resolve_input_folder(folder: str) -> tuple[str, str | None]:
+    """Return (video_path, story_path) discovered inside a movie input folder.
+
+    Looks for:
+      video.<ext>   — any extension in VIDEO_EXTENSIONS
+      story.md / story.txt
+
+    Raises FileNotFoundError when no video file is found.
+    """
+    folder = os.path.abspath(folder)
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"Input folder not found: {folder}")
+
+    video_path: str | None = None
+    for name in os.listdir(folder):
+        stem, ext = os.path.splitext(name)
+        if stem.lower() == "video" and ext.lower() in VIDEO_EXTENSIONS:
+            video_path = os.path.join(folder, name)
+            break
+
+    if video_path is None:
+        raise FileNotFoundError(
+            f"No video file found in {folder}. "
+            f"Expected a file named 'video' with one of: {', '.join(sorted(VIDEO_EXTENSIONS))}"
+        )
+
+    story_path: str | None = None
+    for candidate in ("story.md", "story.txt"):
+        p = os.path.join(folder, candidate)
+        if os.path.isfile(p):
+            story_path = p
+            break
+
+    return video_path, story_path
+
+
+def make_run_dir(name: str) -> str:
+    """Create and return an output run directory named after `name` (movie folder or video stem)."""
+    safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)[:40]
     suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(OUTPUT_BASE, f"{safe_stem}_{suffix}")
+    run_dir = os.path.join(OUTPUT_BASE, f"{safe_name}_{suffix}")
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
 
@@ -283,7 +327,12 @@ def run_render(storyboard: dict, output_mp4: str, concurrency: int = 1) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Movie recap pipeline")
-    parser.add_argument("--video", required=True, help="Input video file path")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--input", metavar="FOLDER",
+        help="Movie input folder containing video.{mp4,mkv,...} and optional story.{md,txt}",
+    )
+    input_group.add_argument("--video", help="Input video file path (legacy — use --input instead)")
     parser.add_argument("--ollama-model", default="gemma4:e2b", help="Ollama model for VLM analysis")
     parser.add_argument("--ollama-host", default="http://localhost:11434", help="Ollama host URL")
     parser.add_argument("--decode-height", type=int, default=640,
@@ -320,7 +369,24 @@ def main():
     pipeline_start = time.time()
     os.makedirs(OUTPUT_BASE, exist_ok=True)
 
-    run_dir = make_run_dir(args.video)
+    # Resolve video path and optional story context from --input folder or --video
+    auto_story_path: str | None = None
+    if args.input:
+        try:
+            video_path, auto_story_path = resolve_input_folder(args.input)
+        except FileNotFoundError as e:
+            print(f"[error] {e}", file=sys.stderr)
+            sys.exit(1)
+        run_name = Path(args.input).resolve().name
+        print(f"[input] folder: {args.input}")
+        print(f"[input] video:  {video_path}")
+        if auto_story_path:
+            print(f"[input] story:  {auto_story_path}")
+    else:
+        video_path = args.video
+        run_name = Path(video_path).stem
+
+    run_dir = make_run_dir(run_name)
     setup_run_logging(run_dir)
     print(f"[run] output directory: {run_dir}")
 
@@ -347,7 +413,7 @@ def main():
         extra_args = ["--ollama-model", args.ollama_model, "--ollama-host", args.ollama_host]
         if args.decode_height:
             extra_args += ["--decode-height", str(args.decode_height)]
-        run_analysis(args.video, analysis_json, extra_args=extra_args)
+        run_analysis(video_path, analysis_json, extra_args=extra_args)
 
     if args.vlm_min_coverage > 0:
         check_vlm_quality(analysis_json, min_ratio=args.vlm_min_coverage)
@@ -358,7 +424,7 @@ def main():
     storyboard = do_transform(
         analysis_path=analysis_json,
         output_path=storyboard_path,
-        video_path=args.video,
+        video_path=video_path,
         fps=args.fps,
         recap_ratio=args.recap_ratio,
         voiceover_dir=voiceover_dir,
@@ -373,12 +439,16 @@ def main():
             print("[error] --deepseek-key required for narration (or set DEEPSEEK_API_KEY)", file=sys.stderr)
             sys.exit(1)
 
-        # Resolve --story-context: accept inline text or a file path
+        # Resolve story context: --story-context takes precedence, then auto-detected story file
         story_context: str | None = args.story_context
         if story_context and os.path.isfile(story_context):
             with open(story_context) as f:
                 story_context = f.read().strip()
-            print(f"[narrate] loaded story context from file ({len(story_context)} chars)")
+            print(f"[narrate] loaded story context from --story-context ({len(story_context)} chars)")
+        elif not story_context and auto_story_path:
+            with open(auto_story_path) as f:
+                story_context = f.read().strip()
+            print(f"[narrate] loaded story context from {auto_story_path} ({len(story_context)} chars)")
 
         from narrate import narrate as do_narrate
 
@@ -450,7 +520,7 @@ def main():
         storyboard = do_transform(
             analysis_path=analysis_json,
             output_path=storyboard_path,
-            video_path=args.video,
+            video_path=video_path,
             fps=args.fps,
             recap_ratio=args.recap_ratio,
             voiceover_dir=voiceover_dir,
@@ -471,7 +541,7 @@ def main():
             json.dump(storyboard, f, indent=2)
 
     # Step 5: Place video + voiceovers in remotion/public/
-    setup_remotion_public(args.video, voiceover_dir=voiceover_dir)
+    setup_remotion_public(video_path, voiceover_dir=voiceover_dir)
 
     # Step 6: Install Node deps
     install_remotion_deps()
@@ -507,7 +577,7 @@ def main():
     sb_meta = storyboard.get("metadata", {})
     run_log = {
         "timestamp": datetime.now().isoformat(),
-        "video": args.video,
+        "video": video_path,
         "output_mp4": output_mp4,
         "run_dir": run_dir,
         "fps": args.fps,
