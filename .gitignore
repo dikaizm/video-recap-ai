@@ -6,3 +6,6 @@ remotion/public/video.mp4
 remotion/public/voiceover/
 output/
 .claude/
+input/
+models/
+.DS_Store

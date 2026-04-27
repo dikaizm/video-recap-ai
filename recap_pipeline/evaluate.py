@@ -124,25 +124,28 @@ def _parse_revisions(raw: str) -> list[dict]:
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
     raw = re.sub(r"\s*```$", "", raw.strip(), flags=re.MULTILINE)
 
-    # Extract the first JSON array found in the response
+    # Try full JSON array parse first
     match = re.search(r"\[.*\]", raw, re.DOTALL)
-    if not match:
-        print(f"    [eval] warning: no JSON array found in response, skipping revisions")
-        return []
+    if match:
+        try:
+            revisions = json.loads(match.group())
+            if isinstance(revisions, list):
+                valid = []
+                for item in revisions:
+                    if isinstance(item, dict) and "window" in item and "revised" in item:
+                        valid.append({"window": int(item["window"]), "revised": str(item["revised"]).strip()})
+                return valid
+        except json.JSONDecodeError:
+            pass
 
-    try:
-        revisions = json.loads(match.group())
-        if not isinstance(revisions, list):
-            print(f"    [eval] warning: parsed JSON is not a list, skipping revisions")
-            return []
-        valid = []
-        for item in revisions:
-            if isinstance(item, dict) and "window" in item and "revised" in item:
-                valid.append({"window": int(item["window"]), "revised": str(item["revised"]).strip()})
-        return valid
-    except json.JSONDecodeError as e:
-        print(f"    [eval] warning: JSON parse error ({e}), skipping revisions")
-        return []
+    # Fallback: extract individual complete objects from a truncated array
+    objects = re.findall(r'\{\s*"window"\s*:\s*(\d+)\s*,\s*"revised"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}', raw)
+    if objects:
+        print(f"    [eval] partial parse: extracted {len(objects)} complete object(s) from truncated response")
+        return [{"window": int(w), "revised": r.replace('\\"', '"')} for w, r in objects]
+
+    print(f"    [eval] warning: could not parse any revisions from response, skipping")
+    return []
 
 
 def evaluate(
@@ -179,7 +182,7 @@ def evaluate(
             {"role": "system", "content": EVAL_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        max_tokens=1200,
+        max_tokens=4000,
         temperature=0.35,
     )
 

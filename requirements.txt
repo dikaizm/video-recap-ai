@@ -8,3 +8,8 @@ faster-whisper>=1.0.0
 # VLM inference is handled by Ollama (no torch/transformers needed)
 # Install Ollama: https://ollama.com
 # Pull model: ollama pull gemma4:e2b
+
+# Qwen3 TTS (Apple Silicon, local inference)
+mlx_audio>=0.4.2
+huggingface_hub[hf_xet]>=1.12.0
+# Download model: huggingface-cli download --local-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit

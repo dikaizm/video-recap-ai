@@ -179,6 +179,7 @@ def build_scene_prompt(
     analysis_scene: dict | None,
     score: int,
     consecutive_hint: str = "",
+    total_duration: float = 0.0,
 ) -> str:
     pov = scene.get("povText", "").strip()
     dialogue = scene.get("dialogue", "").strip()
@@ -191,9 +192,11 @@ def build_scene_prompt(
 
     min_w, max_w = _word_target(score)
     timestamp = scene.get("startFmt", "")
+    pct = int(round(scene["startSec"] / total_duration * 100)) if total_duration else 0
 
     parts = [
-        f"[Scene {scene['window']}" + (f" at {timestamp}" if timestamp else "") + "]",
+        f"[Scene {scene['window']}" + (f" at {timestamp}" if timestamp else "") +
+        (f" — {pct}% through film" if total_duration else "") + "]",
         f"Importance: {score}/5 — Target: {min_w}–{max_w} words",
     ]
     if pov:
@@ -213,6 +216,7 @@ def narrate(
     output_path: str,
     api_key: str,
     analysis_path: str | None = None,
+    story_context: str | None = None,
     force: bool = False,
 ) -> dict:
     if not force and os.path.exists(output_path):
@@ -227,11 +231,13 @@ def narrate(
             storyboard = json.load(f)
 
     analysis_by_window: dict[int, dict] = {}
+    characters_observed: str = ""
     if analysis_path and os.path.exists(analysis_path):
         with open(analysis_path) as f:
             analysis = json.load(f)
         for s in analysis.get("scenes", []):
             analysis_by_window[int(s["window"])] = s
+        characters_observed = analysis.get("characters_observed", "") or analysis.get("context", "")
 
     scenes = storyboard["scenes"]
     total = len(scenes)
@@ -246,6 +252,32 @@ def narrate(
 
     for scene in scenes:
         scene["importanceScore"] = scores.get(scene["window"], 3)
+
+    # If story context is provided it is authoritative — sanitize character roster
+    # by dropping VLM observations that contain gendered terms likely from dark/ambiguous frames
+    if story_context and characters_observed:
+        obs_list = [o for o in characters_observed.split("; ")
+                    if not any(w in o.lower() for w in ("female", "woman"))]
+        characters_observed = "; ".join(obs_list)
+
+    # Build system prompt — inject character constraint and story context
+    narrate_system = NARRATE_SYSTEM_PROMPT
+    if characters_observed:
+        narrate_system += (
+            f"\n\nCHARACTER CONSTRAINT: Only refer to characters actually seen in the film."
+            f" Observed characters: {characters_observed}."
+            f" Do NOT invent genders, names, or people not supported by this list."
+        )
+        print(f"[narrate] character constraint: {characters_observed[:120]}", flush=True)
+    if story_context:
+        narrate_system += (
+            "\n\nSTORY CONTEXT — use this to write accurate story beats when visual "
+            "descriptions are vague, dark, or show only abstract patterns:\n"
+            + story_context
+            + "\n\nWhen the VLM description is unclear, infer the correct story beat from "
+            "the context above. Never contradict it — if it names characters as men, use he/him."
+        )
+        print(f"[narrate] story context injected ({len(story_context)} chars)", flush=True)
 
     # Pass 2: write narration per scene
     # History stores (povText, narratedText) so the model sees what was already described
@@ -272,12 +304,13 @@ def narrate(
             consecutive_hint = f"Note: previous scene already described \"{prev_pov[:60]}\". Advance the story — do not restate."
 
         prompt = build_scene_prompt(
-            scene, analysis_by_window.get(window), score, consecutive_hint
+            scene, analysis_by_window.get(window), score, consecutive_hint,
+            total_duration=total_duration,
         )
 
         context_block = ""
         if narration_history:
-            recent = narration_history[-3:]
+            recent = narration_history[-6:]
             context_block = "Previous scenes (visual description → narration said):\n"
             context_block += "\n".join(f"- [{pov[:55]}] → {nar}" for pov, nar in recent)
             context_block += "\n\n"
@@ -286,7 +319,7 @@ def narrate(
         narration = _http_post(
             api_key,
             messages=[
-                {"role": "system", "content": NARRATE_SYSTEM_PROMPT},
+                {"role": "system", "content": narrate_system},
                 {"role": "user", "content": context_block + prompt},
             ],
             max_tokens=80,
@@ -300,7 +333,7 @@ def narrate(
             narration = _http_post(
                 api_key,
                 messages=[
-                    {"role": "system", "content": NARRATE_SYSTEM_PROMPT},
+                    {"role": "system", "content": narrate_system},
                     {"role": "user", "content": "The visual description is already known to the audience. Write what this scene MEANS for the story — consequence, tension, or character state. Do not describe what is visible.\n\n" + prompt},
                 ],
                 max_tokens=80,
@@ -331,6 +364,7 @@ def main():
     parser.add_argument("--analysis", default=None)
     parser.add_argument("--output", required=True)
     parser.add_argument("--api-key", default=os.environ.get("DEEPSEEK_API_KEY"))
+    parser.add_argument("--story-context", default=None, help="Story synopsis text or path to .txt/.md file")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -338,11 +372,17 @@ def main():
         print("[error] DeepSeek API key required (--api-key or DEEPSEEK_API_KEY env var)", file=sys.stderr)
         sys.exit(1)
 
+    story_context = args.story_context
+    if story_context and os.path.isfile(story_context):
+        with open(story_context) as f:
+            story_context = f.read().strip()
+
     narrate(
         storyboard_path=args.storyboard,
         output_path=args.output,
         api_key=args.api_key,
         analysis_path=args.analysis,
+        story_context=story_context,
         force=args.force,
     )
 

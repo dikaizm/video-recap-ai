@@ -34,7 +34,7 @@ load_dotenv()
 import av
 from PIL import Image
 
-OLLAMA_DEFAULT_MODEL = "gemma4:e2b"
+OLLAMA_DEFAULT_MODEL = "smolvlm:500m"
 OLLAMA_DEFAULT_HOST = "http://localhost:11434"
 
 SYSTEM_PROMPT = """\
@@ -47,7 +47,7 @@ CREDITS: true
 Otherwise describe the scene:
 
 LOCATION: [interior or exterior, describe the setting from the frames]
-CHARACTERS: [who is visible, their clothing, expressions, body language]
+CHARACTERS: [who is visible — describe clothing, build, and visible features ONLY. NEVER state or infer gender unless a face is clearly visible and unambiguous. Use "person" or "figure" when gender is uncertain. NEVER write "male", "female", "man", "woman", "he", "she" unless you are certain from clear facial features.]
 ACTION: [what is literally happening in the frames]
 DIALOGUE: [only if dialogue is provided — what is said and by whom]
 KEY OBJECTS: [specific objects visible in the frames]
@@ -66,17 +66,21 @@ def ollama_generate(
     host: str = OLLAMA_DEFAULT_HOST,
     retries: int = 3,
 ) -> str:
+    # gemma4 (and most Ollama vision models) accept images as a sibling field
+    # on the user message. The content-array format returns 400 for gemma4 in Ollama.
+    # num_predict is omitted — gemma4 returns empty responses when it is set.
     payload = json.dumps({
         "model": model,
-        "system": SYSTEM_PROMPT,
-        "prompt": prompt,
-        "images": images,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt, "images": images},
+        ],
         "stream": False,
-        "options": {"temperature": 0, "num_predict": 400},
+        "options": {"temperature": 0},
     }).encode()
 
     req = urllib.request.Request(
-        f"{host}/api/generate",
+        f"{host}/api/chat",
         data=payload,
         headers={"Content-Type": "application/json"},
     )
@@ -85,7 +89,7 @@ def ollama_generate(
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read())
-                return result["response"].strip()
+                return result["message"]["content"].strip()
         except urllib.error.URLError as e:
             if attempt < retries - 1:
                 wait = 2 ** attempt
@@ -110,14 +114,16 @@ def check_ollama(model: str, host: str) -> None:
         raise RuntimeError(f"Ollama not reachable at {host} — is it running? ({e})") from e
 
 
-def image_to_base64(img: Image.Image, max_size: int = 672) -> str:
-    """Resize image to max_size on longest edge and encode as base64 PNG."""
+def image_to_base64(img: Image.Image, max_size: int = 672, quality: int = 60) -> str:
+    """Resize image to max_size on longest edge and encode as base64 JPEG."""
     w, h = img.size
     if max(w, h) > max_size:
         scale = max_size / max(w, h)
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
     return base64.b64encode(buf.getvalue()).decode()
 
 
@@ -225,23 +231,54 @@ def get_dialogue_for_window(
 # Frame extraction
 # ---------------------------------------------------------------------------
 
-def extract_frames(
-    video_path: str, interval_sec: float
-) -> list[tuple[float, Image.Image]]:
-    frames = []
+def iter_frame_windows(
+    video_path: str,
+    interval_sec: float,
+    window_size: int,
+    overlap: int,
+    decode_height: int | None = None,
+):
+    """Stream analysis windows one at a time — only window_size frames in memory at once."""
     container = av.open(video_path)
     stream = container.streams.video[0]
     fps = float(stream.average_rate)
     interval_frames = max(1, int(fps * interval_sec))
+    step = max(1, window_size - overlap)
 
-    for i, frame in enumerate(container.decode(stream)):
-        if i % interval_frames == 0:
+    # Compute reformat target — only downscale, never upscale
+    target_w: int | None = None
+    target_h: int | None = None
+    if decode_height:
+        orig_w = stream.codec_context.width or 0
+        orig_h = stream.codec_context.height or 0
+        if orig_h and orig_h > decode_height:
+            scale = decode_height / orig_h
+            target_w = int(orig_w * scale) & ~1  # keep even for yuv420p
+            target_h = decode_height
+
+    buffer: list[tuple[float, Image.Image]] = []
+    window_idx = 0
+
+    try:
+        for i, frame in enumerate(container.decode(stream)):
+            if i % interval_frames != 0:
+                continue
             ts = float(frame.pts * stream.time_base)
-            img = frame.to_image()
-            frames.append((ts, img))
+            if target_w and target_h:
+                frame = frame.reformat(width=target_w, height=target_h)
+            buffer.append((ts, frame.to_image()))
 
-    container.close()
-    return frames
+            while len(buffer) >= window_size:
+                chunk = buffer[:window_size]
+                yield window_idx, chunk[0][0], chunk[-1][0], [img for _, img in chunk]
+                window_idx += 1
+                buffer = buffer[step:]
+    finally:
+        container.close()
+
+    # Yield any remaining frames as a partial window
+    if buffer:
+        yield window_idx, buffer[0][0], buffer[-1][0], [img for _, img in buffer]
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +324,30 @@ def extract_prev_scene_summary(description: str, max_chars: int = 300) -> str:
             break
         summary = candidate
     return summary.strip() or description[-max_chars:]
+
+
+def extract_character_roster(results: list[dict]) -> str:
+    """Aggregate unique CHARACTERS observations across all VLM descriptions."""
+    observations = []
+    for entry in results:
+        desc = entry.get("description", "")
+        if not desc or "CREDITS: true" in desc.upper().replace(" ", "").replace(":", ":"):
+            continue
+        for line in desc.splitlines():
+            if line.upper().startswith("CHARACTERS:"):
+                val = line.split(":", 1)[1].strip()
+                if val and val.lower() not in ("none visible", "none", ""):
+                    observations.append(val)
+    if not observations:
+        return ""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for obs in observations:
+        key = obs.lower()[:60]
+        if key not in seen:
+            seen.add(key)
+            unique.append(obs)
+    return "; ".join(unique[:10])
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +411,8 @@ def main():
     parser.add_argument("--language", default=None,
                         help="Force transcript language e.g. 'en' (auto-detected if omitted)")
 
+    parser.add_argument("--decode-height", type=int, default=None,
+                        help="Decode frames at this height before VLM (e.g. 640) — faster, same quality. Default: full resolution.")
     parser.add_argument("--output", default=None,
                         help="Output JSON path (default: <video_stem>_analysis.json)")
     args = parser.parse_args()
@@ -372,6 +435,8 @@ def main():
     print(f"Transcriber:  {transcriber_label}")
     print(f"Video:        {video_path.name}")
     print(f"Params:       interval={args.interval}s  window={args.window}  overlap={args.overlap}")
+    if args.decode_height:
+        print(f"Decode res:   height={args.decode_height}px")
     if args.context:
         print(f"Context:      {args.context[:80]}{'...' if len(args.context) > 80 else ''}")
     print()
@@ -404,36 +469,23 @@ def main():
         print("Step 1/3 — Audio transcription skipped (--no-audio)\n")
 
     # ------------------------------------------------------------------
-    # Step 2: Extract frames
+    # Step 2+3: Stream frames → VLM (no full frame list in memory)
     # ------------------------------------------------------------------
-    print("Step 2/3 — Extracting frames...")
-    all_frames = extract_frames(str(video_path), args.interval)
-    print(f"  → {len(all_frames)} frames extracted")
-
-    step = max(1, args.window - args.overlap)
-    windows: list[tuple[float, float, list[Image.Image]]] = []
-    for i in range(0, len(all_frames), step):
-        chunk = all_frames[i : i + args.window]
-        if not chunk:
-            break
-        windows.append((chunk[0][0], chunk[-1][0], [f for _, f in chunk]))
-
-    print(f"  → {len(windows)} analysis windows\n")
-
-    # ------------------------------------------------------------------
-    # Step 3: VLM analysis via Ollama
-    # ------------------------------------------------------------------
-    print(f"Step 3/3 — Analyzing {len(windows)} windows with {args.ollama_model}...")
+    decode_label = f" at {args.decode_height}p" if args.decode_height else ""
+    print(f"Step 2/3 — Streaming frames{decode_label} → VLM ({args.ollama_model})...")
 
     results = []
     prev_scene_history: list[str] = []
 
-    for idx, (start_ts, end_ts, window_frames) in enumerate(windows):
+    for idx, start_ts, end_ts, window_frames in iter_frame_windows(
+        str(video_path), args.interval, args.window, args.overlap,
+        decode_height=args.decode_height,
+    ):
         start_fmt = format_timestamp(start_ts)
         end_fmt = format_timestamp(end_ts)
         dialogue = get_dialogue_for_window(segments, start_ts, end_ts) if segments else ""
 
-        print(f"[{idx+1:02d}/{len(windows)}] {start_fmt} → {end_fmt}  ({len(window_frames)} frames)", flush=True)
+        print(f"[{idx+1:02d}] {start_fmt} → {end_fmt}  ({len(window_frames)} frames)", flush=True)
         if dialogue:
             preview = dialogue.replace("\n", " ")
             print(f"  Dialogue: {preview[:120]}{'...' if len(preview) > 120 else ''}")
@@ -478,6 +530,9 @@ def main():
         results.append(entry)
 
     processing_sec = round(time.time() - pipeline_start, 1)
+    characters_observed = extract_character_roster(results)
+    if characters_observed:
+        print(f"  → Characters observed: {characters_observed}")
     output = {
         "video": str(video_path),
         "vlm_model": args.ollama_model,
@@ -489,6 +544,8 @@ def main():
         "window_size": args.window,
         "overlap": args.overlap,
         "context": args.context,
+        "decode_height": args.decode_height,
+        "characters_observed": characters_observed,
         "total_windows": len(results),
         "processing_sec": processing_sec,
         "scenes": results,

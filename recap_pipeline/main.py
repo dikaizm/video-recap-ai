@@ -109,6 +109,44 @@ def run_analysis(video_path: str, output_json: str, extra_args: list[str] | None
     return output_json
 
 
+# Minimum fraction of non-credits scenes that must have a non-empty VLM description
+# to allow the pipeline to continue to narration.
+VLM_MIN_DESCRIPTION_RATIO = 0.25
+
+
+def check_vlm_quality(analysis_json: str, min_ratio: float = VLM_MIN_DESCRIPTION_RATIO) -> None:
+    """Abort the pipeline if the VLM produced too few scene descriptions.
+
+    Empty descriptions (blank or credits-only) mean the narration LLM has
+    nothing to ground character identity on, leading to hallucinations.
+    """
+    with open(analysis_json) as f:
+        data = json.load(f)
+    scenes = data.get("scenes", [])
+    non_credits = [s for s in scenes if not s.get("is_credits", False)]
+    if not non_credits:
+        return
+    described = sum(
+        1 for s in non_credits
+        if s.get("description", "").strip() and "CREDITS: true" not in s.get("description", "").upper()
+    )
+    ratio = described / len(non_credits)
+    print(
+        f"[analyze] VLM coverage: {described}/{len(non_credits)} non-credits scenes "
+        f"have descriptions ({ratio:.0%})",
+        flush=True,
+    )
+    if ratio < min_ratio:
+        print(
+            f"\n[error] VLM description coverage too low ({ratio:.0%} < {min_ratio:.0%}).\n"
+            f"  Most scenes have no visual description — narration would hallucinate characters and events.\n"
+            f"  Check that Ollama is running the correct model and that frames are not all black.\n"
+            f"  You can lower the threshold with --vlm-min-coverage or provide --context to guide narration.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _link_or_copy(src: str, dest: str) -> None:
     if os.path.exists(dest) or os.path.islink(dest):
         os.unlink(dest)
@@ -248,6 +286,8 @@ def main():
     parser.add_argument("--video", required=True, help="Input video file path")
     parser.add_argument("--ollama-model", default="gemma4:e2b", help="Ollama model for VLM analysis")
     parser.add_argument("--ollama-host", default="http://localhost:11434", help="Ollama host URL")
+    parser.add_argument("--decode-height", type=int, default=640,
+                        help="Decode video frames at this height before VLM (default: 640, set 0 to disable)")
     parser.add_argument("--skip-analysis", action="store_true", help="Skip analysis step")
     parser.add_argument("--analysis-json", default=None, help="Existing analysis JSON (implies --skip-analysis)")
     parser.add_argument("--fps", type=int, default=30)
@@ -255,15 +295,26 @@ def main():
         "--recap-ratio", type=float, default=0.15,
         help="Recap duration as fraction of original movie (default: 0.15 = 15%%)",
     )
-    parser.add_argument("--tts", choices=["macos", "gtts", "elevenlabs"], default=None)
+    parser.add_argument("--tts", choices=["macos", "gtts", "elevenlabs", "qwen3"], default=None)
     parser.add_argument("--elevenlabs-key", default=None)
     parser.add_argument("--tts-voice", default="Samantha", help="macOS TTS voice name")
+    parser.add_argument("--qwen3-model-path", default=None, help="Path to Qwen3 TTS model directory")
+    parser.add_argument("--qwen3-speaker", default="Aiden", help="Qwen3 speaker name (custom mode)")
+    parser.add_argument("--qwen3-instruct", default="Documentary narrator, calm and clear", help="Qwen3 voice instruction")
+    parser.add_argument("--qwen3-speed", type=float, default=1.0, help="Qwen3 speech speed (default: 1.0)")
+    parser.add_argument("--qwen3-mode", choices=["custom", "design"], default="custom", help="Qwen3 TTS mode")
     parser.add_argument("--narrate", action="store_true", help="Synthesize narration via DeepSeek before TTS")
     parser.add_argument("--deepseek-key", default=os.environ.get("DEEPSEEK_API_KEY"), help="DeepSeek API key (env: DEEPSEEK_API_KEY)")
     parser.add_argument("--narrate-force", action="store_true", help="Re-generate narration even if it exists")
+    parser.add_argument("--story-context", default=None, help="Story synopsis text or path to a .txt/.md file to guide narration")
+    parser.add_argument(
+        "--vlm-min-coverage", type=float, default=VLM_MIN_DESCRIPTION_RATIO,
+        help=f"Minimum fraction of scenes that must have VLM descriptions (default: {VLM_MIN_DESCRIPTION_RATIO}). Set to 0 to disable.",
+    )
     parser.add_argument("--no-evaluate", action="store_true", help="Skip story coherence evaluation after narration")
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--output", default=None, help="Output MP4 path (default: output/<video>_<timestamp>/recap.mp4)")
+    parser.add_argument("--render-height", type=int, default=None, help="Downscale output to this height in pixels (e.g. 480). Width is scaled proportionally.")
     args = parser.parse_args()
 
     pipeline_start = time.time()
@@ -293,10 +344,13 @@ def main():
         print(f"[analyze] using existing JSON: {analysis_json}")
     else:
         analysis_json = os.path.join(run_dir, "analysis.json")
-        run_analysis(args.video, analysis_json, extra_args=[
-            "--ollama-model", args.ollama_model,
-            "--ollama-host", args.ollama_host,
-        ])
+        extra_args = ["--ollama-model", args.ollama_model, "--ollama-host", args.ollama_host]
+        if args.decode_height:
+            extra_args += ["--decode-height", str(args.decode_height)]
+        run_analysis(args.video, analysis_json, extra_args=extra_args)
+
+    if args.vlm_min_coverage > 0:
+        check_vlm_quality(analysis_json, min_ratio=args.vlm_min_coverage)
 
     # Step 2: Transform
     from transform import transform as do_transform
@@ -319,6 +373,13 @@ def main():
             print("[error] --deepseek-key required for narration (or set DEEPSEEK_API_KEY)", file=sys.stderr)
             sys.exit(1)
 
+        # Resolve --story-context: accept inline text or a file path
+        story_context: str | None = args.story_context
+        if story_context and os.path.isfile(story_context):
+            with open(story_context) as f:
+                story_context = f.read().strip()
+            print(f"[narrate] loaded story context from file ({len(story_context)} chars)")
+
         from narrate import narrate as do_narrate
 
         print("[narrate] synthesizing narration via DeepSeek...")
@@ -327,6 +388,7 @@ def main():
             output_path=narrated_storyboard_path,
             api_key=args.deepseek_key,
             analysis_path=analysis_json,
+            story_context=story_context,
             force=args.narrate_force,
         )
         storyboard_path = narrated_storyboard_path
@@ -372,6 +434,15 @@ def main():
                 print("[error] --elevenlabs-key required for ElevenLabs TTS", file=sys.stderr)
                 sys.exit(1)
             tts_kwargs["api_key"] = args.elevenlabs_key
+        elif args.tts == "qwen3":
+            if not args.qwen3_model_path:
+                print("[error] --qwen3-model-path required for Qwen3 TTS", file=sys.stderr)
+                sys.exit(1)
+            tts_kwargs["model_path"] = args.qwen3_model_path
+            tts_kwargs["speaker"] = args.qwen3_speaker
+            tts_kwargs["instruct"] = args.qwen3_instruct
+            tts_kwargs["speed"] = args.qwen3_speed
+            tts_kwargs["mode"] = args.qwen3_mode
 
         print(f"[tts] generating voiceovers with backend={args.tts}...")
         generate_batch(storyboard["scenes"], voiceover_dir, args.tts, **tts_kwargs)
@@ -409,6 +480,27 @@ def main():
     render_start = time.time()
     run_render(storyboard, output_mp4, concurrency=args.concurrency)
     render_sec = round(time.time() - render_start, 1)
+
+    # Optional: downscale to target height
+    if args.render_height:
+        scaled_mp4 = output_mp4.replace(".mp4", f"_{args.render_height}p.mp4")
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            print("[warn] ffmpeg not found — skipping downscale", file=sys.stderr)
+        else:
+            print(f"[render] downscaling to {args.render_height}p → {scaled_mp4}")
+            subprocess.run(
+                [
+                    ffmpeg, "-y", "-i", output_mp4,
+                    "-vf", f"scale=-2:{args.render_height}",
+                    "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+                    "-c:a", "aac", "-b:a", "128k",
+                    scaled_mp4,
+                ],
+                check=True,
+            )
+            output_mp4 = scaled_mp4
+            print(f"[render] downscaled → {output_mp4}")
 
     total_sec = round(time.time() - pipeline_start, 1)
 
