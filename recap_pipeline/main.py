@@ -383,6 +383,16 @@ def main():
     args = parser.parse_args()
 
     pipeline_start = time.time()
+
+    def _ts() -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _elapsed(start: float) -> str:
+        secs = round(time.time() - start, 1)
+        if secs < 60:
+            return f"{secs}s"
+        return f"{int(secs // 60)}m {int(secs % 60)}s"
+
     os.makedirs(OUTPUT_BASE, exist_ok=True)
 
     # Resolve video path and optional story context from --input folder or --video
@@ -411,6 +421,7 @@ def main():
     storyboard_path = os.path.join(run_dir, "storyboard.json")
 
     # Step 1: Analysis
+    step_start = time.time()
     if args.analysis_json:
         analysis_json = args.analysis_json
         print(f"[analyze] using existing JSON: {analysis_json}")
@@ -429,12 +440,16 @@ def main():
         extra_args = ["--ollama-model", args.ollama_model, "--ollama-host", args.ollama_host]
         if args.decode_height:
             extra_args += ["--decode-height", str(args.decode_height)]
+        print(f"[analyze] start at {_ts()} (VLM={args.ollama_model})...")
         run_analysis(video_path, analysis_json, extra_args=extra_args)
+        print(f"[analyze] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
     if args.vlm_min_coverage > 0:
         check_vlm_quality(analysis_json, min_ratio=args.vlm_min_coverage)
 
     # Step 2: Transform
+    step_start = time.time()
+    print(f"[transform] start at {_ts()}...")
     from transform import transform as do_transform
 
     storyboard = do_transform(
@@ -445,6 +460,7 @@ def main():
         recap_ratio=args.recap_ratio,
         voiceover_dir=voiceover_dir,
     )
+    print(f"[transform] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
     # Step 3: Narration (optional)
     narrated_storyboard_path = os.path.join(run_dir, "storyboard_narrated.json")
@@ -468,7 +484,8 @@ def main():
 
         from narrate import narrate as do_narrate
 
-        print("[narrate] synthesizing narration via DeepSeek...")
+        step_start = time.time()
+        print(f"[narrate] start at {_ts()} ({len(storyboard.get('scenes', []))} scenes)...")
         storyboard = do_narrate(
             storyboard_path=storyboard_path,
             output_path=narrated_storyboard_path,
@@ -477,6 +494,7 @@ def main():
             story_context=story_context,
             force=args.narrate_force,
         )
+        print(f"[narrate] done at {_ts()} — elapsed {_elapsed(step_start)}")
         storyboard_path = narrated_storyboard_path
 
         for scene in storyboard["scenes"]:
@@ -524,8 +542,10 @@ def main():
         if args.deepseek_key:
             tts_kwargs["api_key"] = args.deepseek_key
 
-        print(f"[tts] generating voiceovers with Qwen3...")
+        step_start = time.time()
+        print(f"[tts] start at {_ts()}...")
         generate_batch(storyboard["scenes"], voiceover_dir, **tts_kwargs)
+        print(f"[tts] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
         # Persist ttsText (stamped in-place by generate_batch) into the evaluated storyboard
         tts_storyboard_path = os.path.join(run_dir, "storyboard_tts.json")
@@ -562,9 +582,16 @@ def main():
     install_remotion_deps()
 
     # Step 7: Render
-    render_start = time.time()
+    step_start = time.time()
+    print(f"[render] start at {_ts()}...")
     run_render(storyboard, output_mp4, concurrency=args.concurrency, gl=args.gl)
-    render_sec = round(time.time() - render_start, 1)
+    print(f"[render] done at {_ts()} — elapsed {_elapsed(step_start)}")
+
+    pipeline_elapsed = _elapsed(pipeline_start)
+    print(f"\n{'='*60}")
+    print(f"[pipeline] ALL DONE at {_ts()} — total elapsed {pipeline_elapsed}")
+    print(f"[pipeline] output → {output_mp4}")
+    print(f"{'='*60}")
 
     # Optional: downscale to target height
     if args.render_height:
@@ -605,12 +632,11 @@ def main():
         "timing": {
             "analysis_processing_sec": sb_meta.get("analysis_processing_sec"),
             "narration_processing_sec": sb_meta.get("narration_processing_sec"),
-            "render_sec": render_sec,
             "total_sec": total_sec,
         },
     }
     write_run_log(run_dir, run_log)
-    print(f"[done] total pipeline time: {total_sec:.1f}s")
+    print(f"[done] total pipeline time: {_elapsed(pipeline_start)}")
 
 
 if __name__ == "__main__":

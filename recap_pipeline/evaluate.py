@@ -17,7 +17,7 @@ import re
 import time
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-v4-pro"
 
 EVAL_SYSTEM_PROMPT = """\
 You are a story editor reviewing a narration script for a movie recap video.
@@ -57,6 +57,7 @@ def _http_post(api_key: str, messages: list[dict], max_tokens: int = 800,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "thinking": {"type": "disabled"},
     }).encode()
 
     req = urllib.request.Request(
@@ -70,7 +71,7 @@ def _http_post(api_key: str, messages: list[dict], max_tokens: int = 800,
 
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            with urllib.request.urlopen(req, timeout=300) as resp:
                 result = json.loads(resp.read())
                 content = result["choices"][0]["message"]["content"].strip()
                 if not content:

@@ -14,11 +14,12 @@ Usage:
 import argparse
 import json
 import os
+import re as _re
 import sys
 import time
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-v4-pro"
 
 # Word count targets per importance score.
 # Score 5 (climax) gets room for dramatic tension and pay-off.
@@ -30,6 +31,8 @@ SCORE_WORD_TARGETS = {
     2: (10, 16),   # transition — brief but with a hook
     1: (10, 14),   # atmospheric filler — one expanded sentence
 }
+
+NARRATE_BATCH_SIZE = 12  # scenes per API call in batch mode
 
 RANK_SYSTEM_PROMPT = """\
 Score each movie scene 1–5 for narrative importance in a recap voiceover.
@@ -44,7 +47,7 @@ Factor in the scene's position in the film (earlier scenes score lower than the 
 content near the climax). Discovery of a crash site, alien object, or mysterious voice
 should score 4–5 regardless of description quality.
 
-Return ONLY a JSON array of integers, one score per scene in the order given, nothing else.
+Output ONLY a JSON array of integers, one score per scene in the order given.
 Example for 4 scenes: [3,5,2,4]\
 """
 
@@ -96,23 +99,92 @@ HARD RULES — no exceptions:
 Return ONLY the narration text. No labels, no quotes.\
 """
 
+NARRATE_BATCH_SYSTEM = """\
+You are writing spoken voiceover lines for a movie recap video. Your goal is to keep \
+viewers hooked so they do not skip to the next video.
+
+You will receive a BATCH of scenes to narrate. Write one narration line per scene, in order.
+Each line will be read aloud by a text-to-speech voice.
+
+NARRATIVE ARC — let the scene position (% through film) shape your tone:
+- 0–25% (Setup): Build mystery and curiosity. End with unanswered questions.
+- 25–60% (Rising Action): Escalate stakes. End with "but", "only to discover", "unaware that".
+- 60–85% (Climax): Highest tension. Short, punchy sentences. Irreversible change.
+- 85–100% (Resolution): Cost and consequence. Earned ending.
+
+Each line must: (1) advance the story showing consequence, (2) reveal character state, \
+(3) end with a hook or stakes escalation.
+
+HARD RULES:
+- Hit the target word count for each scene (±3 words)
+- NEVER repeat the visual description — reframe as story consequence or character state
+- No metaphors, no abstract nouns as emotion carriers ("weight of", "echoes of")
+- No "we watch / we see / we follow / we witness"
+- No filler phrases: "in this scene", "the camera shows"
+- Vary the sentence opening — never the same structure twice in a row
+- The word "but" or "only to" must appear at least once every 3 lines
+
+OUTPUT a JSON object with a single key "narration" containing an array of strings:
+{"narration": ["scene 1 narration", "scene 2 narration", ...]}
+One string per scene, in the exact order of the scenes provided. No numbering.\
+"""
+
 
 def _word_overlap(a: str, b: str) -> float:
     wa, wb = set(a.lower().split()), set(b.lower().split())
     return len(wa & wb) / max(len(wa | wb), 1)
 
 
+def _parse_batch_response(raw: str, expected_count: int) -> list[str]:
+    """Parse JSON batch narration response into a list of strings."""
+    cleaned = _re.sub(r"<thinking>.*?</thinking>", "", raw, flags=_re.DOTALL).strip()
+
+    # Try parsing as JSON object with "narration" key first
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict) and "narration" in data:
+            return data["narration"]
+        if isinstance(data, list):
+            return data
+    except (json.JSONDecodeError, KeyError):
+        pass
+
+    # Fallback: extract JSON array from response
+    match = _re.search(r"\[.*\]", cleaned, _re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: split by numbered lines "1. 2. 3." or newline-separated
+    lines = [l.strip() for l in cleaned.split("\n") if l.strip()]
+    lines = [_re.sub(r"^\d+[. )]+", "", l).strip() for l in lines]
+    narrations = [l for l in lines if len(l.split()) >= 3]
+    if narrations:
+        return narrations
+
+    raise ValueError(f"Could not parse {expected_count} narrations from: {raw[:200]}")
+
+
 def _http_post(api_key: str, messages: list[dict], max_tokens: int = 120,
-               temperature: float = 0.4, retries: int = 3, timeout: int = 60) -> str:
+               temperature: float = 0.4, retries: int = 3, timeout: int = 60,
+               thinking_enabled: bool = True, json_mode: bool = False) -> str:
     import urllib.request
     import urllib.error
 
-    payload = json.dumps({
+    body: dict = {
         "model": DEEPSEEK_MODEL,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
-    }).encode()
+    }
+    if not thinking_enabled:
+        body["thinking"] = {"type": "disabled"}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+
+    payload = json.dumps(body).encode()
 
     req = urllib.request.Request(
         f"{DEEPSEEK_BASE_URL}/chat/completions",
@@ -171,17 +243,22 @@ def rank_scenes(scenes: list[dict], api_key: str, total_duration_sec: float) -> 
             {"role": "system", "content": RANK_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        max_tokens=max(128, len(scenes) * 4),
+        max_tokens=max(256, len(scenes) * 8),
         temperature=0.1,
-        timeout=60,
+        timeout=120,
+        thinking_enabled=False,
+        json_mode=True,
     )
 
-    print(f"  [rank] response: {raw[:120]}", flush=True)
+    print(f"  [rank] response ({len(raw)} chars): {raw[:120]}", flush=True)
     try:
-        cleaned = raw.strip()
-        start = cleaned.index("[")
-        end = cleaned.rindex("]") + 1
-        scores_list = json.loads(cleaned[start:end])
+        # Extract all integers from response — robust to wrapping, newlines, markdown, thinking blocks
+        numbers = [int(x) for x in _re.findall(r"\d+", raw)]
+        # If there are way more numbers than scenes (e.g. scene IDs), take the last N
+        if len(numbers) >= len(scenes):
+            scores_list = numbers[-len(scenes):] if len(numbers) > len(scenes) else numbers
+        else:
+            raise ValueError(f"got {len(numbers)} integers, need {len(scenes)}")
 
         if len(scores_list) != len(scenes):
             raise ValueError(f"got {len(scores_list)} scores for {len(scenes)} scenes")
@@ -304,73 +381,134 @@ def narrate(
         )
         print(f"[narrate] story context injected ({len(story_context)} chars)", flush=True)
 
-    # Pass 2: write narration per scene
-    # History stores (povText, narratedText) so the model sees what was already described
+    # Pass 2: batch narrate — 12 scenes per API call
     narration_history: list[tuple[str, str]] = [
         (s.get("povText", ""), s["narratedText"])
         for s in scenes if s.get("narratedText")
     ]
 
-    for i, scene in enumerate(scenes):
-        window = scene["window"]
-        existing = scene.get("narratedText", "")
-        if existing and not force:
-            print(f"  skip scene {window:02d} (narration exists, score={scene['importanceScore']})")
-            if not any(nar == existing for _, nar in narration_history):
-                narration_history.append((scene.get("povText", ""), existing))
-            continue
+    pending = [
+        (i, scene) for i, scene in enumerate(scenes)
+        if not scene.get("narratedText") or force
+    ]
 
-        score = scene["importanceScore"]
+    batch_size = NARRATE_BATCH_SIZE
+    total_todo = len(pending)
+    batch_num = 0
 
-        # Detect consecutive similar scenes and add a hint
-        prev_pov = scenes[i - 1].get("povText", "") if i > 0 else ""
-        consecutive_hint = ""
-        if prev_pov and _word_overlap(scene.get("povText", ""), prev_pov) >= 0.6:
-            pct = int(round(scene["startSec"] / total_duration * 100)) if total_duration else 0
-            consecutive_hint = f"Note: previous scene already described \"{prev_pov[:60]}\". Advance the story and escalate tension — do not restate. Scene at {pct}% through film."
-
-        prompt = build_scene_prompt(
-            scene, analysis_by_window.get(window), score, consecutive_hint,
-            total_duration=total_duration,
+    # Batch system prompt with story context and character constraint
+    batch_system = NARRATE_BATCH_SYSTEM
+    if characters_observed:
+        batch_system += (
+            f"\n\nCHARACTER CONSTRAINT: Only refer to characters actually seen in the film."
+            f" Observed characters: {characters_observed}."
+            f" Do NOT invent genders, names, or people not supported by this list."
+        )
+    if story_context:
+        batch_system += (
+            "\n\nSTORY CONTEXT — use this to write accurate story beats when visual "
+            "descriptions are vague, dark, or show only abstract patterns:\n"
+            + story_context
+            + "\n\nWhen the VLM description is unclear, infer the correct story beat from "
+            "the context above. Never contradict it — if it names characters as men, use he/him."
         )
 
-        context_block = ""
+    for chunk_start in range(0, len(pending), batch_size):
+        chunk = pending[chunk_start:chunk_start + batch_size]
+        if not chunk:
+            break
+        batch_num += 1
+        batch_scenes = [(idx, scenes[idx]) for idx, _ in chunk]
+
+        chunk_windows = f"{chunk[0][1]['window']:02d}–{chunk[-1][1]['window']:02d}"
+        print(f"\n  batch {batch_num}: scenes {chunk_windows} ({len(batch_scenes)} scenes)...")
+
+        # Build scene list for the prompt
+        scene_lines: list[str] = []
+        for idx, scene in batch_scenes:
+            w = scene["window"]
+            sc = scene["importanceScore"]
+            min_w, max_w = _word_target(sc)
+            pct = int(round(scene["startSec"] / total_duration * 100)) if total_duration else 0
+            pov = scene.get("povText", "").strip()
+            dialogue = scene.get("dialogue", "").strip()
+            emotion = scene.get("emotion", "").strip()
+
+            line = f"[{w}] importance={sc}/5 target={min_w}–{max_w}w pos={pct}%"
+            if pov:
+                line += f" visual: {pov}"
+            if dialogue:
+                line += f" dialogue: {dialogue}"
+            if emotion:
+                line += f" emotion: {emotion}"
+            scene_lines.append(line)
+
+        # Build history context from last 6 narrated scenes
+        history_block = ""
         if narration_history:
             recent = narration_history[-6:]
-            context_block = "Previous scenes (visual description → narration said):\n"
-            context_block += "\n".join(f"- [{pov[:55]}] → {nar}" for pov, nar in recent)
-            context_block += "\n\n"
+            history_block = "Previous scenes already narrated:\n"
+            history_block += "\n".join(
+                f"- [{pov[:55]}] → {nar}" for pov, nar in recent
+            )
+            history_block += "\n\n"
 
-        max_tokens_for_score = {5: 100, 4: 80, 3: 60, 2: 50, 1: 40}
-        print(f"  narrate scene {window:02d}/{total} (score={score})...")
-        narration = _http_post(
+        user_prompt = history_block + "Scenes to narrate:\n" + "\n".join(scene_lines)
+        # Each scene ~40 words → ~60 tokens; JSON overhead ~300 tokens; pad 2x for safety
+        batch_max_tokens = max(512, len(batch_scenes) * 80 + 400)
+
+        result = _http_post(
             api_key,
             messages=[
-                {"role": "system", "content": narrate_system},
-                {"role": "user", "content": context_block + prompt},
+                {"role": "system", "content": batch_system},
+                {"role": "user", "content": user_prompt},
             ],
-            max_tokens=max_tokens_for_score.get(score, 60),
+            max_tokens=batch_max_tokens,
             temperature=0.5,
+            timeout=180,
+            thinking_enabled=False,
+            json_mode=True,
         )
 
-        # If output is too similar to povText, retry with explicit override
-        pov_text = scene.get("povText", "")
-        if pov_text and _word_overlap(narration, pov_text) >= 0.75:
-            print(f"    [retry] echo detected ({_word_overlap(narration, pov_text):.0%} overlap), regenerating...")
-            narration = _http_post(
-                api_key,
-                messages=[
-                    {"role": "system", "content": narrate_system},
-                    {"role": "user", "content": "The visual description is already known to the audience. Write what this scene MEANS for the story — consequence, tension, or character state. Do not describe what is visible.\n\n" + prompt},
-                ],
-                max_tokens=max_tokens_for_score.get(score, 60),
-                temperature=0.65,
-            )
+        # Parse the JSON response
+        narrations: list[str] = _parse_batch_response(result, len(batch_scenes))
 
-        scene["narratedText"] = narration
-        narration_history.append((pov_text, narration))
-        wc = len(narration.split())
-        print(f"    score={score} words={wc} → {narration[:80]}{'...' if len(narration) > 80 else ''}")
+        for j, (idx, scene) in enumerate(batch_scenes):
+            if j < len(narrations):
+                narration = narrations[j].strip()
+                wc = len(narration.split())
+                # Echo detection + retry for individual scenes
+                pov_text = scene.get("povText", "")
+                if pov_text and _word_overlap(narration, pov_text) >= 0.75:
+                    print(f"    [retry] scene {scene['window']:02d} echo ({_word_overlap(narration, pov_text):.0%})...")
+                    solo_prompt = build_scene_prompt(
+                        scene, analysis_by_window.get(scene["window"]),
+                        scene["importanceScore"],
+                        total_duration=total_duration,
+                    )
+                    narration = _http_post(
+                        api_key,
+                        messages=[
+                            {"role": "system", "content": narrate_system},
+                            {"role": "user", "content": "Rewrite this narration to focus on story consequence, not visual description:\n" + solo_prompt},
+                        ],
+                        max_tokens=80,
+                        temperature=0.65,
+                        timeout=120,
+                        thinking_enabled=False,
+                    )
+                    wc = len(narration.split())
+
+                scene["narratedText"] = narration
+                narration_history.append((pov_text, narration))
+                print(f"    scene {scene['window']:02d} score={scene['importanceScore']} words={wc} → {narration[:80]}{'...' if len(narration) > 80 else ''}")
+
+        # Incremental save after each batch
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        with open(output_path, "w") as f:
+            json.dump(storyboard, f, indent=2)
+        batch_done = min(chunk_start + batch_size, total_todo)
+        print(f"  saved {batch_done}/{total_todo} scenes")
 
     narration_processing_sec = round(time.time() - narrate_start, 1)
     meta = storyboard.setdefault("metadata", {})

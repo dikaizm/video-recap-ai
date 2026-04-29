@@ -196,7 +196,7 @@ def _llm_align_boundaries(
     )
 
     payload = _json.dumps({
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-pro",
         "messages": [
             {"role": "system", "content": f"You find scene boundaries in a speech transcript. Return ONLY a JSON array of exactly {n_boundaries} integers."},
             {"role": "user", "content": prompt},
