@@ -18,7 +18,7 @@ import sys
 import time
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEEPSEEK_MODEL = "deepseek-chat"
 
 # Word count targets per importance score.
 # Floors are high enough that the model must add content beyond the raw povText.
@@ -86,7 +86,7 @@ def _word_overlap(a: str, b: str) -> float:
 
 
 def _http_post(api_key: str, messages: list[dict], max_tokens: int = 120,
-               temperature: float = 0.4, retries: int = 3) -> str:
+               temperature: float = 0.4, retries: int = 3, timeout: int = 60) -> str:
     import urllib.request
     import urllib.error
 
@@ -108,9 +108,16 @@ def _http_post(api_key: str, messages: list[dict], max_tokens: int = 120,
 
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 result = json.loads(resp.read())
-                return result["choices"][0]["message"]["content"].strip()
+                content = result["choices"][0]["message"]["content"].strip()
+                if not content:
+                    usage = result.get("usage", {})
+                    raise RuntimeError(
+                        f"DeepSeek returned empty content — reasoning tokens likely exhausted max_tokens budget. "
+                        f"Usage: {usage}"
+                    )
+                return content
         except urllib.error.HTTPError as e:
             body = e.read().decode()
             if e.code == 429 and attempt < retries - 1:
@@ -149,6 +156,7 @@ def rank_scenes(scenes: list[dict], api_key: str, total_duration_sec: float) -> 
         ],
         max_tokens=max(128, len(scenes) * 4),
         temperature=0.1,
+        timeout=60,
     )
 
     print(f"  [rank] response: {raw[:120]}", flush=True)

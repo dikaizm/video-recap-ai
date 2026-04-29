@@ -240,7 +240,7 @@ def get_audio_duration(mp3_path: str) -> float | None:
 
 
 def adjust_display_frames_to_audio(storyboard: dict, voiceover_dir: str, fps: int) -> dict:
-    """Expand each scene's displayFrames to fit the actual voiceover audio duration."""
+    """Set each scene's displayFrames to exactly match its voiceover audio duration."""
     padding_frames = round(0.4 * fps)
     adjusted = 0
 
@@ -255,12 +255,12 @@ def adjust_display_frames_to_audio(storyboard: dict, voiceover_dir: str, fps: in
             continue
 
         needed_frames = round(duration * fps) + padding_frames
-        if needed_frames > scene["displayFrames"]:
+        if needed_frames != scene["displayFrames"]:
             scene["displayFrames"] = needed_frames
             adjusted += 1
 
     if adjusted:
-        print(f"[sync] expanded displayFrames for {adjusted} scene(s) to fit narration audio")
+        print(f"[sync] set displayFrames for {adjusted} scene(s) to match audio duration")
 
     return storyboard
 
@@ -363,7 +363,7 @@ def main():
     parser.add_argument("--qwen3-model-path", default=_default_qwen3_path, help="Path to Qwen3 TTS model directory")
     parser.add_argument("--qwen3-speaker", default="Ryan", help="Qwen3 speaker name (default: Ryan)")
     parser.add_argument("--qwen3-instruct", default="warm", help="Qwen3 voice instruction (default: warm)")
-    parser.add_argument("--qwen3-speed", type=float, default=1.0, help="Qwen3 speech speed (default: 1.0)")
+    parser.add_argument("--qwen3-speed", type=float, default=1.3, help="Qwen3 speech speed (default: 1.3)")
     parser.add_argument("--qwen3-mode", choices=["custom", "design"], default="custom", help="Qwen3 TTS mode (default: custom)")
     parser.add_argument("--narrate", action="store_true", help="Synthesize narration via DeepSeek before TTS")
     parser.add_argument("--deepseek-key", default=os.environ.get("DEEPSEEK_API_KEY"), help="DeepSeek API key (env: DEEPSEEK_API_KEY)")
@@ -480,8 +480,6 @@ def main():
         storyboard_path = narrated_storyboard_path
 
         for scene in storyboard["scenes"]:
-            if scene.get("narratedText"):
-                scene["povText"] = scene["narratedText"]
             narration_meta[scene["window"]] = {
                 "narratedText": scene.get("narratedText", ""),
                 "importanceScore": scene.get("importanceScore"),
@@ -501,8 +499,6 @@ def main():
         storyboard_path = evaluated_storyboard_path
 
         for scene in storyboard["scenes"]:
-            if scene.get("narratedText"):
-                scene["povText"] = scene["narratedText"]
             narration_meta[scene["window"]] = {
                 "narratedText": scene.get("narratedText", ""),
                 "importanceScore": scene.get("importanceScore"),
@@ -525,9 +521,17 @@ def main():
         }
         if args.qwen3_mode == "custom" and args.qwen3_speaker:
             tts_kwargs["speaker"] = args.qwen3_speaker
+        if args.deepseek_key:
+            tts_kwargs["api_key"] = args.deepseek_key
 
         print(f"[tts] generating voiceovers with Qwen3...")
         generate_batch(storyboard["scenes"], voiceover_dir, **tts_kwargs)
+
+        # Persist ttsText (stamped in-place by generate_batch) into the evaluated storyboard
+        tts_storyboard_path = os.path.join(run_dir, "storyboard_tts.json")
+        with open(tts_storyboard_path, "w") as f:
+            json.dump(storyboard, f, indent=2)
+        print(f"[tts] storyboard with ttsText → {tts_storyboard_path}")
 
         storyboard = do_transform(
             analysis_path=analysis_json,
@@ -542,7 +546,6 @@ def main():
             meta = narration_meta.get(scene["window"])
             if meta:
                 if meta.get("narratedText"):
-                    scene["povText"] = meta["narratedText"]
                     scene["narratedText"] = meta["narratedText"]
                 if meta.get("importanceScore") is not None:
                     scene["importanceScore"] = meta["importanceScore"]

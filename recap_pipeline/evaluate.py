@@ -17,7 +17,7 @@ import re
 import time
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEEPSEEK_MODEL = "deepseek-chat"
 
 EVAL_SYSTEM_PROMPT = """\
 You are a story editor reviewing a narration script for a movie recap video.
@@ -66,9 +66,16 @@ def _http_post(api_key: str, messages: list[dict], max_tokens: int = 800,
 
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=180) as resp:
                 result = json.loads(resp.read())
-                return result["choices"][0]["message"]["content"].strip()
+                content = result["choices"][0]["message"]["content"].strip()
+                if not content:
+                    usage = result.get("usage", {})
+                    raise RuntimeError(
+                        f"DeepSeek returned empty content — reasoning tokens likely exhausted max_tokens budget. "
+                        f"Usage: {usage}"
+                    )
+                return content
         except urllib.error.HTTPError as e:
             body = e.read().decode()
             if e.code == 429 and attempt < retries - 1:
