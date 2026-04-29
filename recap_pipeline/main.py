@@ -1,5 +1,5 @@
 """
-main.py — Full pipeline: analyze → transform → (narrate) → (TTS) → Remotion render.
+main.py — Full pipeline: analyze → transform → (narrate) → TTS → Remotion render.
 
 Usage:
     # Folder-based input (recommended):
@@ -11,20 +11,21 @@ Usage:
     python recap_pipeline/main.py --video /path/to/movie.mp4
 
     # Skip analysis if JSON already exists:
-    python recap_pipeline/main.py --input input/crash_site/ \
+    python recap_pipeline/main.py --input input/crash_site/ \\
         --skip-analysis --analysis-json output/<run>/analysis.json
 
-    # With macOS TTS + DeepSeek narration:
-    python recap_pipeline/main.py --input input/crash_site/ \
-        --tts macos --narrate
+    # With DeepSeek narration:
+    python recap_pipeline/main.py --input input/crash_site/ \\
+        --narrate
 
-    # With ElevenLabs:
-    python recap_pipeline/main.py --input input/crash_site/ \
-        --tts elevenlabs --elevenlabs-key sk_...
+    # Skip TTS (render without voiceover):
+    python recap_pipeline/main.py --input input/crash_site/ \\
+        --no-tts
 """
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -285,10 +286,22 @@ def install_remotion_deps() -> None:
     subprocess.run([npm, "install"], check=True, cwd=REMOTION_DIR)
 
 
-def run_render(storyboard: dict, output_mp4: str, concurrency: int = 1) -> None:
+def _default_concurrency() -> int:
+    """Half of logical CPU count, capped at 8, minimum 2."""
+    try:
+        import multiprocessing
+        return max(2, min(8, multiprocessing.cpu_count() // 2))
+    except Exception:
+        return 4
+
+
+def run_render(storyboard: dict, output_mp4: str, concurrency: int | None = None, gl: str = "angle") -> None:
     npx = shutil.which("npx")
     if not npx:
         raise RuntimeError("npx not found on PATH — install Node.js first")
+
+    if concurrency is None:
+        concurrency = _default_concurrency()
 
     abs_output = os.path.abspath(output_mp4)
     os.makedirs(os.path.dirname(abs_output), exist_ok=True)
@@ -310,6 +323,7 @@ def run_render(storyboard: dict, output_mp4: str, concurrency: int = 1) -> None:
         npx, "remotion", "render", "MovieRecap", abs_output,
         *props_arg,
         "--concurrency", str(concurrency),
+        "--gl", gl,
         "--codec", "h264",
         "--image-format", "jpeg",
         "--log", "verbose",
@@ -344,14 +358,13 @@ def main():
         "--recap-ratio", type=float, default=0.15,
         help="Recap duration as fraction of original movie (default: 0.15 = 15%%)",
     )
-    parser.add_argument("--tts", choices=["macos", "gtts", "elevenlabs", "qwen3"], default=None)
-    parser.add_argument("--elevenlabs-key", default=None)
-    parser.add_argument("--tts-voice", default="Samantha", help="macOS TTS voice name")
-    parser.add_argument("--qwen3-model-path", default=None, help="Path to Qwen3 TTS model directory")
-    parser.add_argument("--qwen3-speaker", default="Aiden", help="Qwen3 speaker name (custom mode)")
-    parser.add_argument("--qwen3-instruct", default="Documentary narrator, calm and clear", help="Qwen3 voice instruction")
+    _default_qwen3_path = os.path.join(PROJECT_ROOT, "models", "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit")
+    parser.add_argument("--no-tts", action="store_true", help="Skip Qwen3 voiceover generation")
+    parser.add_argument("--qwen3-model-path", default=_default_qwen3_path, help="Path to Qwen3 TTS model directory")
+    parser.add_argument("--qwen3-speaker", default="Ryan", help="Qwen3 speaker name (default: Ryan)")
+    parser.add_argument("--qwen3-instruct", default="warm", help="Qwen3 voice instruction (default: warm)")
     parser.add_argument("--qwen3-speed", type=float, default=1.0, help="Qwen3 speech speed (default: 1.0)")
-    parser.add_argument("--qwen3-mode", choices=["custom", "design"], default="custom", help="Qwen3 TTS mode")
+    parser.add_argument("--qwen3-mode", choices=["custom", "design"], default="custom", help="Qwen3 TTS mode (default: custom)")
     parser.add_argument("--narrate", action="store_true", help="Synthesize narration via DeepSeek before TTS")
     parser.add_argument("--deepseek-key", default=os.environ.get("DEEPSEEK_API_KEY"), help="DeepSeek API key (env: DEEPSEEK_API_KEY)")
     parser.add_argument("--narrate-force", action="store_true", help="Re-generate narration even if it exists")
@@ -361,7 +374,10 @@ def main():
         help=f"Minimum fraction of scenes that must have VLM descriptions (default: {VLM_MIN_DESCRIPTION_RATIO}). Set to 0 to disable.",
     )
     parser.add_argument("--no-evaluate", action="store_true", help="Skip story coherence evaluation after narration")
-    parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--concurrency", type=int, default=None,
+                        help="Remotion render concurrency (default: half of CPU cores, max 8)")
+    parser.add_argument("--gl", default="angle",
+                        help="Remotion WebGL backend: angle (default, Metal on macOS), swiftshader, egl")
     parser.add_argument("--output", default=None, help="Output MP4 path (default: output/<video>_<timestamp>/recap.mp4)")
     parser.add_argument("--render-height", type=int, default=None, help="Downscale output to this height in pixels (e.g. 480). Width is scaled proportionally.")
     args = parser.parse_args()
@@ -391,7 +407,7 @@ def main():
     print(f"[run] output directory: {run_dir}")
 
     output_mp4 = args.output or os.path.join(run_dir, "recap.mp4")
-    voiceover_dir = os.path.join(run_dir, "voiceover") if args.tts else None
+    voiceover_dir = os.path.join(run_dir, "voiceover") if not args.no_tts else None
     storyboard_path = os.path.join(run_dir, "storyboard.json")
 
     # Step 1: Analysis
@@ -492,30 +508,26 @@ def main():
                 "importanceScore": scene.get("importanceScore"),
             }
 
-    # Step 4: TTS (optional)
-    if args.tts:
+    # Step 4: TTS (enabled by default, use --no-tts to skip)
+    if not args.no_tts:
         from tts import generate_batch
 
-        tts_kwargs: dict = {}
-        if args.tts == "macos":
-            tts_kwargs["voice"] = args.tts_voice
-        elif args.tts == "elevenlabs":
-            if not args.elevenlabs_key:
-                print("[error] --elevenlabs-key required for ElevenLabs TTS", file=sys.stderr)
-                sys.exit(1)
-            tts_kwargs["api_key"] = args.elevenlabs_key
-        elif args.tts == "qwen3":
-            if not args.qwen3_model_path:
-                print("[error] --qwen3-model-path required for Qwen3 TTS", file=sys.stderr)
-                sys.exit(1)
-            tts_kwargs["model_path"] = args.qwen3_model_path
-            tts_kwargs["speaker"] = args.qwen3_speaker
-            tts_kwargs["instruct"] = args.qwen3_instruct
-            tts_kwargs["speed"] = args.qwen3_speed
-            tts_kwargs["mode"] = args.qwen3_mode
+        if not args.qwen3_model_path or not os.path.exists(args.qwen3_model_path):
+            print(f"[error] Qwen3 model not found at {args.qwen3_model_path!r}. "
+                  f"Use --qwen3-model-path to specify the correct path.", file=sys.stderr)
+            sys.exit(1)
 
-        print(f"[tts] generating voiceovers with backend={args.tts}...")
-        generate_batch(storyboard["scenes"], voiceover_dir, args.tts, **tts_kwargs)
+        tts_kwargs: dict = {
+            "model_path": args.qwen3_model_path,
+            "instruct": args.qwen3_instruct,
+            "speed": args.qwen3_speed,
+            "mode": args.qwen3_mode,
+        }
+        if args.qwen3_mode == "custom" and args.qwen3_speaker:
+            tts_kwargs["speaker"] = args.qwen3_speaker
+
+        print(f"[tts] generating voiceovers with Qwen3...")
+        generate_batch(storyboard["scenes"], voiceover_dir, **tts_kwargs)
 
         storyboard = do_transform(
             analysis_path=analysis_json,
@@ -548,12 +560,13 @@ def main():
 
     # Step 7: Render
     render_start = time.time()
-    run_render(storyboard, output_mp4, concurrency=args.concurrency)
+    run_render(storyboard, output_mp4, concurrency=args.concurrency, gl=args.gl)
     render_sec = round(time.time() - render_start, 1)
 
     # Optional: downscale to target height
     if args.render_height:
-        scaled_mp4 = output_mp4.replace(".mp4", f"_{args.render_height}p.mp4")
+        stem = re.sub(r"_\d+p$", "", Path(output_mp4).stem)
+        scaled_mp4 = str(Path(output_mp4).with_name(f"{stem}_{args.render_height}p.mp4"))
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             print("[warn] ffmpeg not found — skipping downscale", file=sys.stderr)
@@ -582,7 +595,7 @@ def main():
         "run_dir": run_dir,
         "fps": args.fps,
         "recap_ratio": args.recap_ratio,
-        "tts": args.tts,
+        "tts": "qwen3" if not args.no_tts else None,
         "narrate": args.narrate,
         "scene_count": len(storyboard.get("scenes", [])),
         "metadata": sb_meta,
