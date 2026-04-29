@@ -21,12 +21,13 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-chat"
 
 # Word count targets per importance score.
-# Floors are high enough that the model must add content beyond the raw povText.
+# Score 5 (climax) gets room for dramatic tension and pay-off.
+# Lower scores stay tight but add hook-like consequence.
 SCORE_WORD_TARGETS = {
-    5: (20, 30),   # climax / key revelation — full narration
-    4: (15, 22),   # significant story beat
-    3: (12, 18),   # moderate — advances story but not pivotal
-    2: (10, 14),   # transition / establishing — brief observation
+    5: (25, 40),   # climax / key revelation — full dramatic narration
+    4: (18, 28),   # significant story beat — build tension
+    3: (14, 20),   # moderate — advances story, adds consequence
+    2: (10, 16),   # transition — brief but with a hook
     1: (10, 14),   # atmospheric filler — one expanded sentence
 }
 
@@ -48,21 +49,35 @@ Example for 4 scenes: [3,5,2,4]\
 """
 
 NARRATE_SYSTEM_PROMPT = """\
-You are writing spoken voiceover lines for a movie recap video.
+You are writing spoken voiceover lines for a movie recap video. Your goal is to keep \
+viewers hooked so they do not skip to the next video.
 
 Each line will be read aloud by a text-to-speech voice. Write the way a narrator speaks — \
 not the way a film critic writes.
 
 You will receive:
+- Scene position (% through film) to indicate where this falls in the story arc
 - Scene description (from an AI vision model — may be incomplete)
 - Optional: dialogue snippets (from speech recognition — may be fragmented)
 - Optional: scene emotion (dominant feeling in the scene)
 - Importance score (1–5) and a target word count to guide narration density
 - Previous scenes with their visual descriptions and what was said, for continuity
 
-Your job: write narration that hits the target word count as closely as possible.
-For low-importance scenes, keep it brief but add story consequence or character state.
-For high-importance scenes, go deeper — what is at stake, what changes, what is felt.
+NARRATIVE ARC — let the scene position shape your tone:
+- 0–25% (Setup): Build mystery and curiosity. End each line with unanswered questions \
+or a sense that something is off. Do not reveal too much.
+- 25–60% (Rising Action): Escalate stakes. Each scene should make the situation worse. \
+End with "but", "only to discover", "unaware that" — create hooks that pull to the next scene.
+- 60–85% (Climax): Highest tension. Deliver the payoff. Focus on confrontation, \
+revelation, and irreversible change. Short, punchy sentences.
+- 85–100% (Resolution): Show cost and consequence. What did the protagonist lose or gain? \
+Make the ending feel earned.
+
+Every line must do THREE things:
+1. Advance the story — show consequence, not action
+2. Reveal character state — how the protagonist feels or how their situation has changed
+3. End with narrative propulsion — either a hook ("but...", "only to find...") or a \
+stakes escalation ("now there was no turning back")
 
 HARD RULES — no exceptions:
 - Hit the target word count (±3 words)
@@ -75,6 +90,8 @@ HARD RULES — no exceptions:
 - No filler phrases: "in this scene", "we now see", "the camera shows"
 - Vary the sentence opening every line — never the same grammatical structure twice in a row
 - If the visual description is vague, write the most likely plain story beat from context
+- The word "but" or "only to" must appear at least once every 3 lines to keep tension alive
+- Every sentence must be understandable when heard — no pronouns whose referent is ambiguous
 
 Return ONLY the narration text. No labels, no quotes.\
 """
@@ -309,7 +326,8 @@ def narrate(
         prev_pov = scenes[i - 1].get("povText", "") if i > 0 else ""
         consecutive_hint = ""
         if prev_pov and _word_overlap(scene.get("povText", ""), prev_pov) >= 0.6:
-            consecutive_hint = f"Note: previous scene already described \"{prev_pov[:60]}\". Advance the story — do not restate."
+            pct = int(round(scene["startSec"] / total_duration * 100)) if total_duration else 0
+            consecutive_hint = f"Note: previous scene already described \"{prev_pov[:60]}\". Advance the story and escalate tension — do not restate. Scene at {pct}% through film."
 
         prompt = build_scene_prompt(
             scene, analysis_by_window.get(window), score, consecutive_hint,
@@ -323,6 +341,7 @@ def narrate(
             context_block += "\n".join(f"- [{pov[:55]}] → {nar}" for pov, nar in recent)
             context_block += "\n\n"
 
+        max_tokens_for_score = {5: 100, 4: 80, 3: 60, 2: 50, 1: 40}
         print(f"  narrate scene {window:02d}/{total} (score={score})...")
         narration = _http_post(
             api_key,
@@ -330,7 +349,7 @@ def narrate(
                 {"role": "system", "content": narrate_system},
                 {"role": "user", "content": context_block + prompt},
             ],
-            max_tokens=80,
+            max_tokens=max_tokens_for_score.get(score, 60),
             temperature=0.5,
         )
 
@@ -344,7 +363,7 @@ def narrate(
                     {"role": "system", "content": narrate_system},
                     {"role": "user", "content": "The visual description is already known to the audience. Write what this scene MEANS for the story — consequence, tension, or character state. Do not describe what is visible.\n\n" + prompt},
                 ],
-                max_tokens=80,
+                max_tokens=max_tokens_for_score.get(score, 60),
                 temperature=0.65,
             )
 

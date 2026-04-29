@@ -32,6 +32,8 @@ def generate_qwen3_tts(
     speed: float = 1.0,
     mode: str = "custom",           # "custom" | "design"
     sample_rate: int = 24000,
+    temperature: float = 0.5,       # lower = more consistent across chunks
+    max_tokens: int = 2048,         # 400 words ~1200 tokens; leave headroom
 ) -> None:
     try:
         from mlx_audio.tts.generate import generate_audio
@@ -40,12 +42,13 @@ def generate_qwen3_tts(
 
     tmp_dir = tempfile.mkdtemp(prefix="qwen3tts_")
     try:
+        common = dict(model=model, text=text, speed=speed,
+                      output_path=tmp_dir, temperature=temperature,
+                      max_tokens=max_tokens)
         if mode == "design":
-            generate_audio(model=model, text=text, instruct=instruct,
-                           speed=speed, output_path=tmp_dir)
+            generate_audio(instruct=instruct, **common)
         else:
-            generate_audio(model=model, text=text, voice=speaker,
-                           instruct=instruct, speed=speed, output_path=tmp_dir)
+            generate_audio(voice=speaker, instruct=instruct, **common)
 
         wav_path = os.path.join(tmp_dir, "audio_000.wav")
         if not os.path.exists(wav_path):
@@ -291,7 +294,7 @@ def _chop_audio(
 # ── main entry point ─────────────────────────────────────────────────
 
 
-_TTS_CHUNK_WORDS = 150  # Qwen3-TTS context limit is ~200 words; stay safe
+_TTS_CHUNK_WORDS = 400  # Qwen3-TTS handles 500+ words reliably; larger chunks = fewer seams
 
 
 def _split_into_chunks(scenes: list[dict], max_words: int) -> list[list[dict]]:

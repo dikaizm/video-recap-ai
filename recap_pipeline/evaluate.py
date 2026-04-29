@@ -29,6 +29,9 @@ IDENTIFY and REWRITE lines that have any of these problems:
 - Use hollow or abstract phrasing ("the weight of", "echoes of", "a lone figure", "silence speaks", "bears witness")
 - Stall the story — same emotion or action restated across 3+ consecutive lines
 - AI-sounding filler that adds no story information
+- No narrative propulsion — a line that describes action without consequence, \
+hook, or character state change
+- 3+ consecutive lines without "but", "only to", "now", or another tension-carrying word
 
 OUTPUT: Return a JSON array of ONLY the scenes that need fixing:
 [{"window": <scene_number>, "revised": "<new narration>"}]
@@ -36,6 +39,7 @@ OUTPUT: Return a JSON array of ONLY the scenes that need fixing:
 RULES for rewrites:
 - Match the approximate word count of the original (±3 words)
 - Each revised line must read distinctly differently from its neighbors
+- Every revised line must end with a hook, a consequence, or an escalation of stakes
 - No poetic language, no metaphors, no observer phrases ("we see", "we watch", "we witness")
 - Advance the story — show consequence, character state, or what changes
 - If a line is already good, do NOT include it in the output
