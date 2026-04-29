@@ -18,7 +18,7 @@ import sys
 import time
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-v4-pro"
 
 # Word count targets per importance score.
 # Floors are high enough that the model must add content beyond the raw povText.

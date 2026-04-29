@@ -17,7 +17,7 @@ import re
 import time
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-v4-pro"
 
 EVAL_SYSTEM_PROMPT = """\
 You are a story editor reviewing a narration script for a movie recap video.

@@ -1,11 +1,10 @@
 """
 tts.py — Qwen3-TTS voiceover generation via mlx_audio (Apple Silicon).
 
-Generates per-scene MP3 files from a continuous TTS stream:
+Generates per-scene MP3 files from a single continuous TTS stream:
   1. Concatenate all scene narrations into one text.
-  2. Split into ~2-minute chunks (memory constraint).
-  3. Generate one continuous TTS audio per chunk (consistent voice).
-  4. Chop each chunk into individual scene_{N}.mp3 via ffmpeg
+  2. Generate one TTS call for the entire duration (consistent voice).
+  3. Chop into individual scene_{N}.mp3 via ffmpeg
      using word-count-proportional timestamps.
 """
 import os
@@ -72,7 +71,7 @@ def load_qwen3_model(model_path: str):
     return load_model(resolved)
 
 
-# ── continuous-mode helpers ───────────────────────────────────────────
+
 
 def _count_words(text: str) -> int:
     return len(text.split())
@@ -90,53 +89,21 @@ def _get_mp3_duration(mp3_path: str) -> float:
     return float(result.stdout.strip())
 
 
-def _split_into_chunks(
+def _chop_audio(
     scenes: list[dict],
-    max_chunk_sec: int = 120,
-    wpm: int = 200,
-) -> list[list[dict]]:
-    chunks: list[list[dict]] = []
-    current_chunk: list[dict] = []
-    current_words = 0
-    words_per_sec = wpm / 60
-
-    for scene in scenes:
-        text = scene.get("povText") or scene.get("description", "")
-        if not text.strip():
-            continue
-        scene_words = _count_words(text)
-        scene_sec = scene_words / words_per_sec
-
-        if current_chunk and current_words / words_per_sec + scene_sec > max_chunk_sec:
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_words = 0
-
-        current_chunk.append(scene)
-        current_words += scene_words
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
-
-def _chop_group(
-    group: list[dict],
-    chunk_audio_path: str,
-    chunk_duration: float,
+    audio_path: str,
+    audio_duration: float,
     voiceover_dir: str,
-    wpm: int = 200,
 ) -> None:
     total_words = sum(
         _count_words(s.get("povText") or s.get("description", ""))
-        for s in group
+        for s in scenes
     )
     if total_words == 0:
         return
 
     cumulative_words = 0
-    for scene in group:
+    for scene in scenes:
         text = scene.get("povText") or scene.get("description", "")
         scene_words = _count_words(text)
         window = scene["window"]
@@ -147,12 +114,12 @@ def _chop_group(
             cumulative_words += scene_words
             continue
 
-        start_sec = (cumulative_words / total_words) * chunk_duration
-        end_sec = ((cumulative_words + scene_words) / total_words) * chunk_duration
+        start_sec = (cumulative_words / total_words) * audio_duration
+        end_sec = ((cumulative_words + scene_words) / total_words) * audio_duration
         duration = end_sec - start_sec
 
         subprocess.run(
-            ["ffmpeg", "-y", "-i", chunk_audio_path,
+            ["ffmpeg", "-y", "-i", audio_path,
              "-ss", f"{start_sec:.3f}",
              "-t", f"{duration:.3f}",
              "-q:a", "4",
@@ -173,12 +140,11 @@ def generate_batch(
     model_path: str,
     **kwargs,
 ) -> list[str]:
-    """Generate per-scene MP3 voiceovers from a continuous TTS stream.
+    """Generate per-scene MP3 voiceovers from a single continuous TTS stream.
 
-    Concatenates all scene narrations, splits into ~2-minute chunks
-    (memory constraint), generates one TTS call per chunk for consistent
-    voice timbre, then chops each chunk into individual scene_{N}.mp3
-    files using word-count-proportional timestamps.
+    Concatenates all scene narrations, generates one TTS call for
+    consistent voice timbre across the entire duration, then chops into
+    individual scene_{N}.mp3 files using word-count-proportional timestamps.
     """
     os.makedirs(voiceover_dir, exist_ok=True)
 
@@ -193,24 +159,19 @@ def generate_batch(
     if not scenes_with_text:
         return [""] * len(scenes)
 
-    chunk_groups = _split_into_chunks(scenes_with_text, max_chunk_sec=120, wpm=200)
-    print(f"[tts] {len(scenes_with_text)} scenes → {len(chunk_groups)} chunk(s)")
+    concatenated_text = " ".join(
+        s.get("povText") or s.get("description", "") for s in scenes_with_text
+    )
+    word_count = _count_words(concatenated_text)
+    print(f"[tts] {len(scenes_with_text)} scenes, {word_count} words — generating full audio…")
 
-    for chunk_idx, group in enumerate(chunk_groups):
-        tag = f"chunk {chunk_idx + 1}/{len(chunk_groups)}"
-        concatenated_text = " ".join(
-            s.get("povText") or s.get("description", "") for s in group
-        )
-        print(f"[tts] {tag}: generating {_count_words(concatenated_text)} words continuously…")
+    tmp_path = os.path.join(voiceover_dir, "_full.mp3")
+    generate_qwen3_tts(concatenated_text, tmp_path, model=qwen3_model, **kwargs)
 
-        chunk_path = os.path.join(voiceover_dir, f"_chunk_{chunk_idx:02d}.mp3")
-        generate_qwen3_tts(concatenated_text, chunk_path, model=qwen3_model, **kwargs)
-
-        chunk_duration = _get_mp3_duration(chunk_path)
-        print(f"[tts] {tag}: {chunk_duration:.1f}s audio — chopping into {len(group)} scene(s)")
-        _chop_group(group, chunk_path, chunk_duration, voiceover_dir, wpm=200)
-
-        os.unlink(chunk_path)
+    audio_duration = _get_mp3_duration(tmp_path)
+    print(f"[tts] {audio_duration:.1f}s audio — chopping into {len(scenes_with_text)} scene(s)")
+    _chop_audio(scenes_with_text, tmp_path, audio_duration, voiceover_dir)
+    os.unlink(tmp_path)
 
     window_to_path: dict[int, str] = {}
     for scene in scenes_with_text:

@@ -9,3 +9,5 @@ output/
 input/
 models/
 .DS_Store
+remotion/out/
+docs/
