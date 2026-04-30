@@ -22,14 +22,16 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = "deepseek-v4-pro"
 
 # Word count targets per importance score.
-# Score 5 (climax) gets room for dramatic tension and pay-off.
-# Lower scores stay tight but add hook-like consequence.
+# These targets are calibrated for ~15% recap ratio where each scene gets ~2-3s of video time.
+# At 1.3x TTS speed, we have ~2.5-4s of audio budget per scene.
+# Normal speech: ~2.5 words/sec. At 1.3x speed: ~3.2 words/sec.
+# So 2.5s audio = ~8 words max per scene on average.
 SCORE_WORD_TARGETS = {
-    5: (25, 40),   # climax / key revelation — full dramatic narration
-    4: (18, 28),   # significant story beat — build tension
-    3: (14, 20),   # moderate — advances story, adds consequence
-    2: (10, 16),   # transition — brief but with a hook
-    1: (10, 14),   # atmospheric filler — one expanded sentence
+    5: (12, 18),   # climax / key revelation — punchy, memorable
+    4: (8, 14),    # significant story beat — one strong sentence
+    3: (6, 10),    # moderate — brief consequence statement
+    2: (4, 8),     # transition — 5-6 words max
+    1: (0, 6),     # atmospheric filler — 0-5 words or skip entirely
 }
 
 NARRATE_BATCH_SIZE = 12  # scenes per API call in batch mode
@@ -83,7 +85,11 @@ Every line must do THREE things:
 stakes escalation ("now there was no turning back")
 
 HARD RULES — no exceptions:
-- Hit the target word count (±3 words)
+- CRITICAL: Hit the target word count EXACTLY. These are SHORT voiceover snippets for a fast-paced recap.
+- For score 1-2 scenes (low importance): Write 0-8 words max. Often just 5-6 words is enough.
+- For score 3 scenes: 6-10 words. One punchy sentence.
+- For score 4-5 scenes (high importance): 8-18 words max. Even climaxes must be brief.
+- BREVITY IS ESSENTIAL: Each scene has only 2-3 seconds of video time. Long narration will be cut off.
 - NEVER repeat or closely paraphrase the visual description — always reframe in terms of story consequence, character state, or what changes
 - When consecutive scenes show the same action (walking, exiting, credits rolling), each line must advance the story or shift perspective — never restate the same beat
 - No metaphors, poetic comparisons, or symbolic language
@@ -116,7 +122,11 @@ Each line must: (1) advance the story showing consequence, (2) reveal character 
 (3) end with a hook or stakes escalation.
 
 HARD RULES:
-- Hit the target word count for each scene (±3 words)
+- CRITICAL: These are SHORT snippets for a fast recap. Each scene has only 2-3 seconds of video.
+- Score 1-2 scenes: 0-8 words max (often just 5-6 words)
+- Score 3 scenes: 6-10 words max
+- Score 4-5 scenes: 8-18 words max (even climaxes must be brief)
+- Hit the target word count EXACTLY. Brevity is essential.
 - NEVER repeat the visual description — reframe as story consequence or character state
 - No metaphors, no abstract nouns as emotion carriers ("weight of", "echoes of")
 - No "we watch / we see / we follow / we witness"
@@ -354,6 +364,26 @@ def narrate(
 
     for scene in scenes:
         scene["importanceScore"] = scores.get(scene["window"], 3)
+
+    # Skip narration for score 1 scenes (filler/atmospheric) to control audio duration
+    skipped = 0
+    for scene in scenes:
+        if scene["importanceScore"] == 1:
+            scene["narratedText"] = ""
+            skipped += 1
+    if skipped > 0:
+        print(f"[narrate] skipped {skipped} score-1 scenes (filler/atmospheric)", flush=True)
+
+    # Also skip credits/title scenes explicitly
+    credits_skipped = 0
+    for scene in scenes:
+        pov = scene.get("povText", "")
+        if "CREDITS" in pov.upper() or "TITLE" in pov.upper():
+            scene["narratedText"] = ""
+            scene["importanceScore"] = 1  # Mark as low importance
+            credits_skipped += 1
+    if credits_skipped > 0:
+        print(f"[narrate] skipped {credits_skipped} credits/title scenes", flush=True)
 
     # If story context is provided it is authoritative — sanitize character roster
     # by dropping VLM observations that contain gendered terms likely from dark/ambiguous frames

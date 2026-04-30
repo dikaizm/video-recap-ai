@@ -89,9 +89,17 @@ def build_scene(
         if os.path.exists(candidate):
             voiceover_path = f"voiceover/scene_{window:02d}.mp3"
 
+    # Support both new JSON format (vlm_data) and old text format
     description = scene.get("description", "")
-    emotion_match = EMOTION_PATTERN.search(description)
-    emotion = emotion_match.group(1).strip() if emotion_match else ""
+    vlm_data = scene.get("vlm_data")
+    
+    # Extract emotion from vlm_data if available, else from description text
+    emotion = ""
+    if vlm_data and isinstance(vlm_data, dict):
+        emotion = vlm_data.get("emotion", "")
+    if not emotion:
+        emotion_match = EMOTION_PATTERN.search(description)
+        emotion = emotion_match.group(1).strip() if emotion_match else ""
 
     result: dict = {
         "window": window,

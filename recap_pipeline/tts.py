@@ -27,12 +27,21 @@ def generate_qwen3_tts(
     text: str,
     output_mp3_path: str,
     model,                          # pre-loaded mlx_audio model
-    speaker: str | None = "Ryan",
-    instruct: str = "warm",
+    # Voice Design Guidelines:
+    # - Be specific: "deep, low-pitched" not "nice voice"
+    # - Be multidimensional: combine gender, age, pitch, pace, emotion, characteristics, purpose
+    # - Be objective: describe physical/perceptual features, not preferences
+    # - Be concise: under 2048 chars, every word adds meaning
+    # - Supported: Chinese and English only
+    instruct: str = (
+        "A middle-aged male voice with a deep, low-pitched tone and magnetic quality. "
+        "Brisk, efficient pace at 1.3x speed for recap narration. "
+        "Rich vocal texture, serious yet calm emotional register. "
+        "Ideal for documentary narration and thriller storytelling."
+    ),
     speed: float = 1.0,
-    mode: str = "custom",           # "custom" | "design"
     sample_rate: int = 24000,
-    temperature: float = 0.5,       # lower = more consistent across chunks
+    temperature: float = 0.3,       # lower = more consistent voice across scenes
     max_tokens: int = 2048,         # 400 words ~1200 tokens; leave headroom
 ) -> None:
     try:
@@ -42,13 +51,16 @@ def generate_qwen3_tts(
 
     tmp_dir = tempfile.mkdtemp(prefix="qwen3tts_")
     try:
-        common = dict(model=model, text=text, speed=speed,
-                      output_path=tmp_dir, temperature=temperature,
-                      max_tokens=max_tokens)
-        if mode == "design":
-            generate_audio(instruct=instruct, **common)
-        else:
-            generate_audio(voice=speaker, instruct=instruct, **common)
+        # Always use voice design mode (instruct-only, no speaker)
+        generate_audio(
+            model=model,
+            text=text,
+            speed=speed,
+            output_path=tmp_dir,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            instruct=instruct
+        )
 
         wav_path = os.path.join(tmp_dir, "audio_000.wav")
         if not os.path.exists(wav_path):
@@ -339,11 +351,11 @@ def generate_batch(
     api_key: str | None = None,
     **kwargs,
 ) -> list[str]:
-    """Generate per-scene MP3 voiceovers from a chunked TTS stream.
+    """Generate per-scene MP3 voiceovers — one TTS call per scene.
 
-    Splits narration into chunks of ≤150 words (Qwen3-TTS context limit),
-    generates one TTS call per chunk, concatenates into _full.mp3, then chops
-    into individual scene_{N}.mp3 files using LLM-aligned STT timestamps.
+    No chunking, no chopping, no word-count alignment. Each scene gets its own TTS
+    generation call, so timing is exact and the audio for scene N matches the video
+    for scene N precisely.
     """
     os.makedirs(voiceover_dir, exist_ok=True)
 
@@ -359,73 +371,60 @@ def generate_batch(
         return [""] * len(scenes)
 
     total_words = sum(_count_words(_scene_text(s)) for s in scenes_with_text)
-    chunks = _split_into_chunks(scenes_with_text, _TTS_CHUNK_WORDS)
-    print(f"[tts] {len(scenes_with_text)} scenes, {total_words} words → {len(chunks)} chunk(s)")
+    total = len(scenes_with_text)
+    print(f"[tts] {total} scenes, {total_words} words — per-scene generation")
 
-    chunk_paths: list[str] = []
-    for i, chunk in enumerate(chunks):
-        chunk_text = " ".join(_scene_text(s) for s in chunk)
-        chunk_path = os.path.join(voiceover_dir, f"_chunk_{i:02d}.mp3")
-        chunk_words = _count_words(chunk_text)
-        print(f"  chunk {i+1}/{len(chunks)}: {len(chunk)} scenes, {chunk_words} words")
-        generate_qwen3_tts(chunk_text, chunk_path, model=qwen3_model, **kwargs)
-        chunk_paths.append(chunk_path)
+    window_to_path: dict[int, str] = {}
+    for i, scene in enumerate(scenes_with_text):
+        w = scene["window"]
+        text = _scene_text(scene)
+        wc = _count_words(text)
+        out_path = os.path.join(voiceover_dir, f"scene_{w:02d}.mp3")
 
-    full_path = os.path.join(voiceover_dir, "_full.mp3")
-    if len(chunk_paths) == 1:
-        import shutil as _shutil
-        _shutil.copy2(chunk_paths[0], full_path)
-    else:
-        print(f"[tts] concatenating {len(chunk_paths)} chunks → _full.mp3")
-        _concat_mp3s(chunk_paths, full_path)
+        if os.path.exists(out_path):
+            print(f"  skip scene {w:02d}/{total} (exists)")
+            window_to_path[w] = out_path
+            continue
 
-    audio_duration = _get_mp3_duration(full_path)
-    print(f"[tts] {audio_duration:.1f}s audio — chopping into {len(scenes_with_text)} scene(s)")
-    segments = _chop_audio(scenes_with_text, full_path, audio_duration, voiceover_dir, api_key=api_key)
-    print(f"[tts] full audio saved → {full_path}")
+        print(f"  scene {w:02d}/{total} ({wc} words)...")
+        generate_qwen3_tts(text, out_path, model=qwen3_model, **kwargs)
+        window_to_path[w] = out_path
 
-    # Stamp ttsText onto each scene dict (in-place) so callers can persist it
+        # Save progress incrementally — stamp ttsText
+        scene["ttsText"] = text
+
+        if i % 20 == 0:
+            import json as _json
+            manifest = {
+                "totalWords": total_words,
+                "scenes": [
+                    {"window": s["window"], "ttsText": _scene_text(s),
+                     "audioPath": f"scene_{s['window']:02d}.mp3"}
+                    for s in scenes_with_text[:i+1]
+                ],
+            }
+            manifest_path = os.path.join(voiceover_dir, "tts_manifest.json")
+            with open(manifest_path, "w") as f:
+                _json.dump(manifest, f, indent=2)
+
+    # Stamp ttsText on all scenes
     for scene in scenes_with_text:
         scene["ttsText"] = _scene_text(scene)
 
-    # Write manifest for review
+    # Write final manifest
     import json as _json
-    seg_by_window = {s["window"]: s for s in segments}
     manifest = {
         "totalWords": total_words,
-        "audioDurationSec": round(audio_duration, 3),
-        "chunks": [
-            {
-                "index": i,
-                "scenes": [s["window"] for s in chunk],
-                "words": _count_words(" ".join(_scene_text(s) for s in chunk)),
-                "text": " ".join(_scene_text(s) for s in chunk),
-            }
-            for i, chunk in enumerate(chunks)
-        ],
         "scenes": [
-            {
-                "window": scene["window"],
-                "ttsText": _scene_text(scene),
-                "audioPath": f"scene_{scene['window']:02d}.mp3",
-                **{k: seg_by_window[scene["window"]][k]
-                   for k in ("start", "end")
-                   if scene["window"] in seg_by_window},
-            }
-            for scene in scenes_with_text
+            {"window": s["window"], "ttsText": _scene_text(s),
+             "audioPath": f"scene_{s['window']:02d}.mp3"}
+            for s in scenes_with_text
         ],
     }
     manifest_path = os.path.join(voiceover_dir, "tts_manifest.json")
     with open(manifest_path, "w") as f:
         _json.dump(manifest, f, indent=2)
     print(f"[tts] manifest → {manifest_path}")
-
-    window_to_path: dict[int, str] = {}
-    for scene in scenes_with_text:
-        w = scene["window"]
-        p = os.path.join(voiceover_dir, f"scene_{w:02d}.mp3")
-        if os.path.exists(p):
-            window_to_path[w] = p
 
     return [window_to_path.get(s["window"], "") for s in scenes]
 

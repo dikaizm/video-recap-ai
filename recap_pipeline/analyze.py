@@ -23,10 +23,13 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Queue
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -39,20 +42,23 @@ OLLAMA_DEFAULT_HOST = "http://localhost:11434"
 
 SYSTEM_PROMPT = """\
 You are a video analyst. Look carefully at the frames provided and answer only what you can directly observe.
-Do NOT invent details that are not visible. Do NOT write prose — use the exact structure below.
+Do NOT invent details that are not visible.
 
 IMPORTANT: If the frames show title cards, opening titles, closing credits, production logos, or end credits (scrolling text, cast lists, crew names), respond with exactly:
-CREDITS: true
+{"is_credits": true}
 
-Otherwise describe the scene:
+Otherwise, output a JSON object with this exact structure:
+{
+  "location": "interior or exterior, describe the setting from the frames",
+  "characters": "who is visible — describe clothing, build, and visible features ONLY. NEVER state or infer gender unless a face is clearly visible and unambiguous. Use 'person' or 'figure' when gender is uncertain. NEVER write 'male', 'female', 'man', 'woman', 'he', 'she' unless you are certain from clear facial features.",
+  "action": "what is literally happening in the frames",
+  "dialogue": "only if dialogue is provided — what is said and by whom",
+  "key_objects": "specific objects visible in the frames",
+  "mood": "the visual atmosphere — lighting, color, composition",
+  "emotion": "the dominant human emotion in this scene — fear, grief, tension, relief, anger, confusion, determination, isolation, etc. — infer from body language, expressions, and context even if faces are not clearly visible"
+}
 
-LOCATION: [interior or exterior, describe the setting from the frames]
-CHARACTERS: [who is visible — describe clothing, build, and visible features ONLY. NEVER state or infer gender unless a face is clearly visible and unambiguous. Use "person" or "figure" when gender is uncertain. NEVER write "male", "female", "man", "woman", "he", "she" unless you are certain from clear facial features.]
-ACTION: [what is literally happening in the frames]
-DIALOGUE: [only if dialogue is provided — what is said and by whom]
-KEY OBJECTS: [specific objects visible in the frames]
-MOOD: [the visual atmosphere — lighting, color, composition]
-EMOTION: [the dominant human emotion in this scene — fear, grief, tension, relief, anger, confusion, determination, isolation, etc. — infer from body language, expressions, and context even if faces are not clearly visible]"""
+Respond ONLY with the JSON object. No markdown, no explanations."""
 
 
 # ---------------------------------------------------------------------------
@@ -315,15 +321,61 @@ def build_user_prompt(
     return "\n".join(parts)
 
 
+def _is_credits_response(text: str) -> bool:
+    """Check if VLM response indicates credits/titles."""
+    if not text:
+        return False
+    try:
+        data = json.loads(text)
+        return data.get("is_credits") is True
+    except json.JSONDecodeError:
+        # Fallback: check for old format
+        return "CREDITS:TRUE" in text.upper().replace(" ", "")
+
+
+def _parse_vlm_response(text: str) -> dict:
+    """Parse VLM JSON response into structured data."""
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Fallback: try to parse old text format
+        result = {}
+        for line in text.splitlines():
+            if ":" in line:
+                key, val = line.split(":", 1)
+                key = key.strip().lower().replace(" ", "_")
+                result[key] = val.strip()
+        return result
+
+
+def _format_description(data: dict) -> str:
+    """Format parsed VLM data into human-readable description."""
+    if data.get("is_credits"):
+        return "CREDITS: true"
+    parts = []
+    for key in ["location", "characters", "action", "dialogue", "key_objects", "mood", "emotion"]:
+        val = data.get(key, "")
+        if val:
+            parts.append(f"{key.upper().replace('_', ' ')}: {val}")
+    return "\n".join(parts)
+
+
 def extract_prev_scene_summary(description: str, max_chars: int = 300) -> str:
-    sentences = [s.strip() for s in description.replace("\n", " ").split(".") if s.strip()]
-    summary = ""
-    for sentence in reversed(sentences):
-        candidate = sentence + ". " + summary
-        if len(candidate) > max_chars:
-            break
-        summary = candidate
-    return summary.strip() or description[-max_chars:]
+    """Extract a summary from the previous scene for context."""
+    # Handle both JSON and old text format
+    data = _parse_vlm_response(description)
+    if data.get("is_credits"):
+        return ""
+    # Build summary from action and characters
+    parts = []
+    for key in ["action", "characters", "emotion"]:
+        val = data.get(key, "")
+        if val:
+            parts.append(val)
+    summary = ". ".join(parts)
+    return summary[:max_chars] if summary else description[:max_chars]
 
 
 def extract_character_roster(results: list[dict]) -> str:
@@ -331,13 +383,12 @@ def extract_character_roster(results: list[dict]) -> str:
     observations = []
     for entry in results:
         desc = entry.get("description", "")
-        if not desc or "CREDITS: true" in desc.upper().replace(" ", "").replace(":", ":"):
+        if not desc or _is_credits_response(desc):
             continue
-        for line in desc.splitlines():
-            if line.upper().startswith("CHARACTERS:"):
-                val = line.split(":", 1)[1].strip()
-                if val and val.lower() not in ("none visible", "none", ""):
-                    observations.append(val)
+        data = _parse_vlm_response(desc)
+        chars = data.get("characters", "")
+        if chars and chars.lower() not in ("none visible", "none", ""):
+            observations.append(chars)
     if not observations:
         return ""
     seen: set[str] = set()
@@ -447,29 +498,39 @@ def main():
     print("  → Ollama ready\n")
 
     # ------------------------------------------------------------------
-    # Step 1: Transcribe audio
+    # Step 1: Extract audio (quick) + Start transcription in parallel
     # ------------------------------------------------------------------
     segments: list[dict] = []
+    transcript_future = None
 
     if not args.no_audio:
-        print("Step 1/3 — Transcribing audio...")
+        print("Step 1/3 — Extracting audio and starting transcription...")
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_wav = tmp.name
-        try:
-            extract_audio(str(video_path), tmp_wav)
-            segments = transcribe(tmp_wav, args.transcriber, args.whisper_model, args.language)
-        finally:
-            Path(tmp_wav).unlink(missing_ok=True)
-
-        print(f"  → {len(segments)} transcript segments")
-        transcript_path.write_text(json.dumps(segments, indent=2, ensure_ascii=False))
-        print(f"  → Transcript saved to: {transcript_path}")
-        print()
+        extract_audio(str(video_path), tmp_wav)
+        
+        # Start transcription in background thread
+        def transcribe_worker():
+            try:
+                segs = transcribe(tmp_wav, args.transcriber, args.whisper_model, args.language)
+                transcript_path.write_text(json.dumps(segs, indent=2, ensure_ascii=False))
+                print(f"\n  → Transcription complete: {len(segs)} segments")
+                Path(tmp_wav).unlink(missing_ok=True)
+                return segs
+            except Exception as e:
+                print(f"\n  → Transcription error: {e}")
+                Path(tmp_wav).unlink(missing_ok=True)
+                return []
+        
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=1)
+        transcript_future = executor.submit(transcribe_worker)
+        print(f"  → Transcription running in background\n")
     else:
         print("Step 1/3 — Audio transcription skipped (--no-audio)\n")
 
     # ------------------------------------------------------------------
-    # Step 2+3: Stream frames → VLM (no full frame list in memory)
+    # Step 2+3: Stream frames → VLM (runs in parallel with transcription)
     # ------------------------------------------------------------------
     decode_label = f" at {args.decode_height}p" if args.decode_height else ""
     print(f"Step 2/3 — Streaming frames{decode_label} → VLM ({args.ollama_model})...")
@@ -483,7 +544,14 @@ def main():
     ):
         start_fmt = format_timestamp(start_ts)
         end_fmt = format_timestamp(end_ts)
-        dialogue = get_dialogue_for_window(segments, start_ts, end_ts) if segments else ""
+        
+        # Get dialogue from transcription if available
+        dialogue = ""
+        if transcript_future:
+            if transcript_future.done():
+                segments = transcript_future.result()
+                dialogue = get_dialogue_for_window(segments, start_ts, end_ts)
+            # If not done yet, proceed without dialogue (will be added in post-processing if needed)
 
         print(f"[{idx+1:02d}] {start_fmt} → {end_fmt}  ({len(window_frames)} frames)", flush=True)
         if dialogue:
@@ -494,7 +562,7 @@ def main():
         if not args.no_continuity and prev_scene_history:
             prev_context = "\n".join(prev_scene_history[-3:])
 
-        description = analyze_window(
+        raw_response = analyze_window(
             frames=window_frames,
             start_ts=start_ts,
             end_ts=end_ts,
@@ -505,7 +573,12 @@ def main():
             prev_scene=prev_context,
         )
 
-        is_credits = "CREDITS: true" in description.upper().replace(" ", "").replace(":", ":")
+        # Parse VLM response (JSON or fallback to text)
+        parsed_data = _parse_vlm_response(raw_response)
+        is_credits = parsed_data.get("is_credits") is True
+
+        # Format description for storage (human-readable or JSON string)
+        description = _format_description(parsed_data) if parsed_data else raw_response
 
         if is_credits:
             print(f"  → credits/title detected, skipping\n")
@@ -526,8 +599,21 @@ def main():
             "is_credits": is_credits,
             "dialogue": dialogue,
             "description": description,
+            "vlm_data": parsed_data if parsed_data else None,
         }
         results.append(entry)
+    
+    # Wait for transcription to complete if still running
+    if transcript_future:
+        print("\nWaiting for transcription to complete...")
+        segments = transcript_future.result()
+        executor.shutdown()
+        print(f"  → Transcript saved to: {transcript_path}")
+        
+        # Backfill dialogue for scenes that were processed before transcription finished
+        for entry in results:
+            if not entry["dialogue"]:
+                entry["dialogue"] = get_dialogue_for_window(segments, entry["start_sec"], entry["end_sec"])
 
     processing_sec = round(time.time() - pipeline_start, 1)
     characters_observed = extract_character_roster(results)

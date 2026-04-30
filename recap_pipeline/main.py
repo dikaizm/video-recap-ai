@@ -358,13 +358,8 @@ def main():
         "--recap-ratio", type=float, default=0.15,
         help="Recap duration as fraction of original movie (default: 0.15 = 15%%)",
     )
-    _default_qwen3_path = os.path.join(PROJECT_ROOT, "models", "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit")
     parser.add_argument("--no-tts", action="store_true", help="Skip Qwen3 voiceover generation")
-    parser.add_argument("--qwen3-model-path", default=_default_qwen3_path, help="Path to Qwen3 TTS model directory")
-    parser.add_argument("--qwen3-speaker", default="Ryan", help="Qwen3 speaker name (only lowercase used internally)")
-    parser.add_argument("--qwen3-instruct", default="warm", help="Qwen3 instruct for emotion/style modulation")
     parser.add_argument("--qwen3-speed", type=float, default=1.3, help="Qwen3 speech speed (default: 1.3)")
-    parser.add_argument("--qwen3-mode", choices=["custom", "design"], default="custom", help="Qwen3 TTS mode (default: custom)")
     parser.add_argument("--narrate", action="store_true", help="Synthesize narration via DeepSeek before TTS")
     parser.add_argument("--deepseek-key", default=os.environ.get("DEEPSEEK_API_KEY"), help="DeepSeek API key (env: DEEPSEEK_API_KEY)")
     parser.add_argument("--narrate-force", action="store_true", help="Re-generate narration even if it exists")
@@ -526,19 +521,28 @@ def main():
     if not args.no_tts:
         from tts import generate_batch
 
-        if not args.qwen3_model_path or not os.path.exists(args.qwen3_model_path):
-            print(f"[error] Qwen3 model not found at {args.qwen3_model_path!r}. "
-                  f"Use --qwen3-model-path to specify the correct path.", file=sys.stderr)
+        _qwen3_model_path = os.path.join(PROJECT_ROOT, "models", "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit")
+        if not os.path.exists(_qwen3_model_path):
+            print(f"[error] Qwen3 model not found at {_qwen3_model_path!r}. "
+                  f"Download it to the models/ directory.", file=sys.stderr)
             sys.exit(1)
 
+        # Default voice design for cinematic thriller narration
+        # Guidelines: specific, multidimensional, objective, original, concise
+        # Dimensions: gender, age, pitch, pace, emotion, characteristics, purpose
+        # Speed: 1.3x = brisk, efficient delivery for recap pacing
+        _qwen3_instruct = (
+            "A middle-aged male voice with a deep, low-pitched tone and magnetic quality. "
+            "Brisk, efficient pace at 1.3x speed for recap narration. "
+            "Rich vocal texture, serious yet calm emotional register. "
+            "Ideal for documentary narration and thriller storytelling."
+        )
+
         tts_kwargs: dict = {
-            "model_path": args.qwen3_model_path,
-            "instruct": args.qwen3_instruct,
+            "model_path": _qwen3_model_path,
+            "instruct": _qwen3_instruct,
             "speed": args.qwen3_speed,
-            "mode": args.qwen3_mode,
         }
-        if args.qwen3_mode == "custom" and args.qwen3_speaker:
-            tts_kwargs["speaker"] = args.qwen3_speaker
         if args.deepseek_key:
             tts_kwargs["api_key"] = args.deepseek_key
 
