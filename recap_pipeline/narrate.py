@@ -109,10 +109,10 @@ NARRATE_BATCH_SYSTEM = """\
 You are writing spoken voiceover lines for a movie recap video. Your goal is to keep \
 viewers hooked so they do not skip to the next video.
 
-You will receive a BATCH of scenes to narrate. Write one narration line per scene, in order.
+You will receive a BATCH of story beats to narrate. Write one narration line per beat, in order.
 Each line will be read aloud by a text-to-speech voice.
 
-NARRATIVE ARC — let the scene position (% through film) shape your tone:
+NARRATIVE ARC — let the beat's position (% through film) shape your tone:
 - 0–25% (Setup): Build mystery and curiosity. End with unanswered questions.
 - 25–60% (Rising Action): Escalate stakes. End with "but", "only to discover", "unaware that".
 - 60–85% (Climax): Highest tension. Short, punchy sentences. Irreversible change.
@@ -122,21 +122,20 @@ Each line must: (1) advance the story showing consequence, (2) reveal character 
 (3) end with a hook or stakes escalation.
 
 HARD RULES:
-- CRITICAL: These are SHORT snippets for a fast recap. Each scene has only 2-3 seconds of video.
-- Score 1-2 scenes: 0-8 words max (often just 5-6 words)
-- Score 3 scenes: 6-10 words max
-- Score 4-5 scenes: 8-18 words max (even climaxes must be brief)
-- Hit the target word count EXACTLY. Brevity is essential.
+- Hit the target word count exactly so the spoken narration fills the full beat with no trailing silence.
+- Each beat covers 2-3 scenes and has 4-8 seconds of video. Use the time to tell the story.
 - NEVER repeat the visual description — reframe as story consequence or character state
 - No metaphors, no abstract nouns as emotion carriers ("weight of", "echoes of")
 - No "we watch / we see / we follow / we witness"
 - No filler phrases: "in this scene", "the camera shows"
 - Vary the sentence opening — never the same structure twice in a row
 - The word "but" or "only to" must appear at least once every 3 lines
+- Name the main characters: Briggs, Sam, Mason, Kai, Graydon, etc.
+- Every sentence must be understandable when heard — no pronouns whose referent is ambiguous
 
 OUTPUT a JSON object with a single key "narration" containing an array of strings:
 {"narration": ["scene 1 narration", "scene 2 narration", ...]}
-One string per scene, in the exact order of the scenes provided. No numbering.\
+One string per beat, in the exact order of the beats provided. No numbering.\
 """
 
 
@@ -321,6 +320,171 @@ def build_scene_prompt(
         parts.append(consecutive_hint)
 
     return "\n".join(parts)
+
+
+# Word count targets for beats (4-8s video time each at TTS speed 1.0 ≈ 3 wps)
+# Each beat covers 2-3 scenes; narration must fill the full beat duration so audio
+# matches the video segment with no trailing silence.
+BEAT_WORD_TARGETS = {
+    5: (38, 50),   # climax beat — full dramatic moment
+    4: (30, 42),   # significant beat — detailed story beat
+    3: (24, 34),   # moderate beat — clear consequence + character state
+    2: (16, 24),   # transition beat — brief context
+    1: (8, 14),    # atmospheric beat — minimal but never silent
+}
+
+
+def narrate_beats(
+    storyboard_path: str,
+    output_path: str,
+    api_key: str,
+    analysis_path: str | None = None,
+    story_context: str | None = None,
+    force: bool = False,
+) -> dict:
+    """Narrate clustered beats instead of individual scenes.
+    
+    Each beat has 8-14s of video time, allowing 10-30 words of narration.
+    Returns storyboard with narratedText on each beat.
+    """
+    if not force and os.path.exists(output_path):
+        with open(output_path) as f:
+            storyboard = json.load(f)
+        has_narration = all(s.get("narratedText") for s in storyboard.get("scenes", []))
+        if has_narration:
+            print("[narrate_beats] existing narration found, skipping (use --narrate-force to regenerate)")
+            return storyboard
+    else:
+        with open(storyboard_path) as f:
+            storyboard = json.load(f)
+
+    analysis_by_window: dict[int, dict] = {}
+    characters_observed: str = ""
+    if analysis_path and os.path.exists(analysis_path):
+        with open(analysis_path) as f:
+            analysis = json.load(f)
+        for s in analysis.get("scenes", []):
+            analysis_by_window[int(s["window"])] = s
+        characters_observed = analysis.get("characters_observed", "") or analysis.get("context", "")
+
+    beats = storyboard["scenes"]
+    total = len(beats)
+    total_scenes = sum(len(b.get("scenes", [])) for b in beats)
+    narrate_start = time.time()
+
+    total_duration = max((s.get("endSec", 0) for s in beats), default=1.0)
+
+    # Build system prompt
+    narrate_system = NARRATE_BATCH_SYSTEM
+    if characters_observed:
+        narrate_system += (
+            f"\n\nCHARACTER CONSTRAINT: Only refer to characters actually seen in the film."
+            f" Observed characters: {characters_observed}."
+            f" Do NOT invent genders, names, or people not supported by this list."
+        )
+    if story_context:
+        narrate_system += (
+            "\n\nSTORY CONTEXT — use this to write accurate story beats when visual "
+            "descriptions are vague, dark, or show only abstract patterns:\n"
+            + story_context
+            + "\n\nWhen the VLM description is unclear, infer the correct story beat from "
+            "the context above."
+        )
+    
+    print(f"[narrate_beats] {total} beats ({total_scenes} scenes), story context: {len(story_context or '')} chars")
+
+    # Narrate in batches. Skip:
+    #  - intro beats (always — they have purpose-built narration from intro.py)
+    #  - beats with existing narratedText, unless force=True
+    batch_size = NARRATE_BATCH_SIZE
+    pending = [
+        (i, b) for i, b in enumerate(beats)
+        if not b.get("isIntro") and (force or not b.get("narratedText"))
+    ]
+    skipped_existing = total - len(pending)
+    if skipped_existing > 0:
+        print(f"[narrate_beats] skipping {skipped_existing} beat(s) (intro or already narrated)")
+
+    narration_history: list[str] = []
+    batch_num = 0
+    saved_count = 0
+
+    for chunk_start in range(0, len(pending), batch_size):
+        chunk = pending[chunk_start:chunk_start + batch_size]
+        if not chunk:
+            break
+        batch_num += 1
+        batch_beats = [beats[idx] for idx, _ in chunk]
+
+        chunk_windows = f"{chunk[0][0]:02d}–{chunk[-1][0]:02d}"
+        print(f"\n  batch {batch_num}: beats {chunk_windows} ({len(batch_beats)} beats)...")
+
+        # Build beat descriptions for the prompt
+        scene_lines: list[str] = []
+        for beat_idx, beat in enumerate(batch_beats):
+            # Assign a synthetic window for identification
+            beat_id = chunk_start + beat_idx
+            pct = int(round(beat.get("startSec", 0) / total_duration * 100)) if total_duration else 0
+            pov = beat.get("povText", "").strip()
+            dialogue = beat.get("dialogue", "").strip()
+            # Use middle importance score
+            score = 3  # Default for beats
+            min_w, max_w = BEAT_WORD_TARGETS[score]
+
+            line = f"[Beat {beat_id}] score={score}/5 target={min_w}–{max_w}w pos={pct}%"
+            if pov:
+                # Include full description, not just truncated
+                line += f" visual: {pov[:500]}"
+            if dialogue:
+                line += f" dialogue: {dialogue[:300]}"
+            scene_lines.append(line)
+
+        # History
+        history_block = ""
+        if narration_history:
+            recent = narration_history[-6:]
+            history_block = "Previous beats already narrated:\n"
+            history_block += "\n".join(f"- {nar}" for nar in recent)
+            history_block += "\n\n"
+
+        user_prompt = history_block + "Beats to narrate:\n" + "\n".join(scene_lines)
+        batch_max_tokens = max(512, len(batch_beats) * 100 + 400)
+
+        result = _http_post(
+            api_key,
+            messages=[
+                {"role": "system", "content": narrate_system},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=batch_max_tokens,
+            temperature=0.5,
+            timeout=180,
+            thinking_enabled=False,
+            json_mode=True,
+        )
+
+        narrations: list[str] = _parse_batch_response(result, len(batch_beats))
+
+        for j, (orig_idx, beat) in enumerate(chunk):
+            if j < len(narrations):
+                narration = narrations[j].strip()
+                beats[orig_idx]["narratedText"] = narration
+                wc = len(narration.split())
+                print(f"    beat {orig_idx+1:02d} words={wc} → {narration[:80]}...")
+                narration_history.append(narration)
+            else:
+                beats[orig_idx]["narratedText"] = ""
+
+        # Save progress
+        saved_count = chunk_start + len(chunk)
+        storyboard["scenes"] = beats
+        with open(output_path, "w") as f:
+            json.dump(storyboard, f, indent=2)
+        if saved_count > 0 and saved_count % 20 == 0:
+            print(f"  saved {saved_count}/{total} beats")
+
+    print(f"[narrate_beats] wrote {total} beats → {output_path}")
+    return storyboard
 
 
 def narrate(

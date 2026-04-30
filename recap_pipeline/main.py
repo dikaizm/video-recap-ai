@@ -240,7 +240,11 @@ def get_audio_duration(mp3_path: str) -> float | None:
 
 
 def adjust_display_frames_to_audio(storyboard: dict, voiceover_dir: str, fps: int) -> dict:
-    """Set each scene's displayFrames to exactly match its voiceover audio duration."""
+    """Set each scene's displayFrames to exactly match its voiceover audio duration.
+
+    If the scene already has a `segments` list, those are scaled proportionally and
+    a final-segment correction makes their sum exactly equal the new total.
+    """
     padding_frames = round(0.4 * fps)
     adjusted = 0
 
@@ -255,9 +259,23 @@ def adjust_display_frames_to_audio(storyboard: dict, voiceover_dir: str, fps: in
             continue
 
         needed_frames = round(duration * fps) + padding_frames
-        if needed_frames != scene["displayFrames"]:
+        old_frames = scene["displayFrames"]
+        if needed_frames != old_frames:
             scene["displayFrames"] = needed_frames
             adjusted += 1
+
+            segs = scene.get("segments")
+            if isinstance(segs, list) and segs and old_frames > 0:
+                ratio = needed_frames / old_frames
+                running = 0
+                for seg in segs:
+                    seg_new = max(1, round(seg.get("displayFrames", 1) * ratio))
+                    seg["displayFrames"] = seg_new
+                    running += seg_new
+                # Reconcile rounding so the sum equals needed_frames exactly.
+                diff = needed_frames - running
+                if diff != 0 and segs:
+                    segs[-1]["displayFrames"] = max(1, segs[-1]["displayFrames"] + diff)
 
     if adjusted:
         print(f"[sync] set displayFrames for {adjusted} scene(s) to match audio duration")
@@ -353,13 +371,28 @@ def main():
                         help="Decode video frames at this height before VLM (default: 640, set 0 to disable)")
     parser.add_argument("--skip-analysis", action="store_true", help="Skip analysis step")
     parser.add_argument("--analysis-json", default=None, help="Existing analysis JSON (implies --skip-analysis)")
+    parser.add_argument("--resume", action="store_true", help="Resume from last successful step (auto-detects what needs to be run)")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
         "--recap-ratio", type=float, default=0.15,
         help="Recap duration as fraction of original movie (default: 0.15 = 15%%)",
     )
     parser.add_argument("--no-tts", action="store_true", help="Skip Qwen3 voiceover generation")
-    parser.add_argument("--qwen3-speed", type=float, default=1.3, help="Qwen3 speech speed (default: 1.3)")
+    parser.add_argument("--qwen3-speed", type=float, default=1.0, help="Qwen3 speech speed (default: 1.0)")
+    parser.add_argument("--max-beat-sec", type=float, default=8.0,
+                        help="Maximum beat duration in seconds (default: 8.0)")
+    parser.add_argument("--min-beat-sec", type=float, default=4.0,
+                        help="Minimum beat duration in seconds (default: 4.0)")
+    parser.add_argument("--no-intro", action="store_true",
+                        help="Skip prepending an intro beat to the recap")
+    parser.add_argument("--intro-scenes", type=int, default=3,
+                        help="Number of establishing source scenes to use in the intro (default: 3)")
+    parser.add_argument("--no-align", action="store_true",
+                        help="Skip post-TTS STT+LLM scene alignment (segments)")
+    parser.add_argument("--align-whisper-model", default="tiny.en",
+                        help="faster-whisper model size for align STT (default: tiny.en)")
+    parser.add_argument("--align-expand", type=int, default=2,
+                        help="Neighbor expansion when picking candidate scenes per phrase (default: 2)")
     parser.add_argument("--narrate", action="store_true", help="Synthesize narration via DeepSeek before TTS")
     parser.add_argument("--deepseek-key", default=os.environ.get("DEEPSEEK_API_KEY"), help="DeepSeek API key (env: DEEPSEEK_API_KEY)")
     parser.add_argument("--narrate-force", action="store_true", help="Re-generate narration even if it exists")
@@ -407,13 +440,101 @@ def main():
         video_path = args.video
         run_name = Path(video_path).stem
 
-    run_dir = make_run_dir(run_name)
+    # Find existing run directory for --resume
+    def _find_latest_run(name: str) -> str | None:
+        """Find the most recent run directory for this video."""
+        matching = []
+        for d in os.listdir(OUTPUT_BASE):
+            if d.startswith(name + "_") and os.path.isdir(os.path.join(OUTPUT_BASE, d)):
+                matching.append(d)
+        if not matching:
+            return None
+        # Sort by timestamp (newest last)
+        matching.sort()
+        return os.path.join(OUTPUT_BASE, matching[-1])
+
+    if args.resume:
+        existing_run = _find_latest_run(run_name)
+        if existing_run:
+            run_dir = existing_run
+            print(f"[resume] using existing run: {run_dir}")
+        else:
+            print(f"[resume] no existing run found, creating new")
+            run_dir = make_run_dir(run_name)
+    else:
+        run_dir = make_run_dir(run_name)
+
     setup_run_logging(run_dir)
     print(f"[run] output directory: {run_dir}")
 
     output_mp4 = args.output or os.path.join(run_dir, "recap.mp4")
     voiceover_dir = os.path.join(run_dir, "voiceover") if not args.no_tts else None
     storyboard_path = os.path.join(run_dir, "storyboard.json")
+    narrated_storyboard_path = os.path.join(run_dir, "storyboard_narrated.json")
+    evaluated_storyboard_path = os.path.join(run_dir, "storyboard_evaluated.json")
+    tts_storyboard_path = os.path.join(run_dir, "storyboard_tts.json")
+    analysis_json = os.path.join(run_dir, "analysis.json")
+
+    # Detect completed steps for --resume
+    def _detect_completed_steps():
+        completed = set()
+        if os.path.exists(analysis_json):
+            try:
+                with open(analysis_json) as f:
+                    data = json.load(f)
+                    if data.get("scenes"):
+                        completed.add("analysis")
+            except:
+                pass
+        if os.path.exists(storyboard_path):
+            completed.add("transform")
+        if os.path.exists(narrated_storyboard_path):
+            try:
+                with open(narrated_storyboard_path) as f:
+                    data = json.load(f)
+                scenes = data.get("scenes", [])
+                if scenes:
+                    narrated_count = sum(1 for s in scenes if s.get("narratedText"))
+                    # Consider complete if 95%+ scenes have narration
+                    if narrated_count >= len(scenes) * 0.95:
+                        completed.add("narrate")
+            except:
+                pass
+        if os.path.exists(evaluated_storyboard_path):
+            completed.add("evaluate")
+        if os.path.exists(voiceover_dir):
+            try:
+                mp3_count = len([f for f in os.listdir(voiceover_dir) if f.endswith(".mp3")])
+                # Also check narrated storyboard for scene count
+                if os.path.exists(narrated_storyboard_path):
+                    with open(narrated_storyboard_path) as f:
+                        data = json.load(f)
+                    scenes = data.get("scenes", [])
+                    # Consider complete if 95%+ of narrated scenes have voiceovers
+                    narrated_scenes = [s for s in scenes if s.get("narratedText")]
+                    if narrated_scenes and mp3_count >= len(narrated_scenes) * 0.95:
+                        completed.add("tts")
+            except:
+                pass
+        if os.path.exists(output_mp4):
+            completed.add("render")
+        return completed
+
+    if args.resume:
+        completed_steps = _detect_completed_steps()
+        print(f"[resume] detected completed steps: {', '.join(sorted(completed_steps)) or 'none'}")
+        if "analysis" in completed_steps and not args.analysis_json:
+            args.skip_analysis = True
+            print(f"[resume] skipping analysis (already complete)")
+        if "narrate" in completed_steps and not args.narrate_force:
+            args.narrate = False
+            print(f"[resume] skipping narration (already complete, use --narrate-force to regenerate)")
+        if "tts" in completed_steps:
+            args.no_tts = True
+            print(f"[resume] skipping TTS (already complete)")
+        if "render" in completed_steps:
+            print(f"[resume] render already complete: {output_mp4}")
+            return
 
     # Step 1: Analysis
     step_start = time.time()
@@ -421,17 +542,20 @@ def main():
         analysis_json = args.analysis_json
         print(f"[analyze] using existing JSON: {analysis_json}")
     elif args.skip_analysis:
-        candidates = [
-            os.path.join(OUTPUT_BASE, "analysis.json"),
-            os.path.join(OUTPUT_BASE, "shared", "analysis.json"),
-        ]
-        analysis_json = next((p for p in candidates if os.path.exists(p)), None)
-        if not analysis_json:
-            print("[error] --skip-analysis set but no analysis.json found", file=sys.stderr)
-            sys.exit(1)
-        print(f"[analyze] using existing JSON: {analysis_json}")
+        # For --resume, use the analysis.json in run_dir first
+        if os.path.exists(analysis_json):
+            print(f"[analyze] using existing JSON: {analysis_json}")
+        else:
+            candidates = [
+                os.path.join(OUTPUT_BASE, "analysis.json"),
+                os.path.join(OUTPUT_BASE, "shared", "analysis.json"),
+            ]
+            analysis_json = next((p for p in candidates if os.path.exists(p)), None)
+            if not analysis_json:
+                print("[error] --skip-analysis set but no analysis.json found", file=sys.stderr)
+                sys.exit(1)
+            print(f"[analyze] using existing JSON: {analysis_json}")
     else:
-        analysis_json = os.path.join(run_dir, "analysis.json")
         extra_args = ["--ollama-model", args.ollama_model, "--ollama-host", args.ollama_host]
         if args.decode_height:
             extra_args += ["--decode-height", str(args.decode_height)]
@@ -442,7 +566,7 @@ def main():
     if args.vlm_min_coverage > 0:
         check_vlm_quality(analysis_json, min_ratio=args.vlm_min_coverage)
 
-    # Step 2: Transform
+    # Step 2: Transform (scene selection)
     step_start = time.time()
     print(f"[transform] start at {_ts()}...")
     from transform import transform as do_transform
@@ -457,8 +581,68 @@ def main():
     )
     print(f"[transform] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
+    # Step 2b: Cluster scenes into beats (for proper pacing)
+    clustered_storyboard_path = os.path.join(run_dir, "storyboard_clustered.json")
+    from cluster import cluster_scenes
+
+    step_start = time.time()
+    print(f"[cluster] start at {_ts()}...")
+    target_duration = sum(s["displayFrames"] for s in storyboard["scenes"]) / args.fps
+    # Keep the source-scene pool around so align.py can expand to neighbors and
+    # intro.py can pick establishing shots.
+    source_scenes_pool = list(storyboard["scenes"])
+    clustered_scenes = cluster_scenes(
+        storyboard["scenes"],
+        target_duration=target_duration,
+        fps=args.fps,
+        min_beat_sec=args.min_beat_sec,
+        max_beat_sec=args.max_beat_sec,
+    )
+    clustered = {**storyboard, "scenes": clustered_scenes}
+    with open(clustered_storyboard_path, "w") as f:
+        json.dump(clustered, f, indent=2)
+    print(f"[cluster] done at {_ts()} — elapsed {_elapsed(step_start)}")
+
+    # Step 2c: Build + prepend the intro beat (skipped with --no-intro or when
+    # narration is disabled, since the intro narration is generated via DeepSeek).
+    if not args.no_intro and args.narrate:
+        if not args.deepseek_key:
+            print("[intro] skipping — DeepSeek key required (or pass --no-intro)")
+        else:
+            # Resolve story context for the intro narration.
+            _intro_context: str | None = args.story_context
+            if _intro_context and os.path.isfile(_intro_context):
+                with open(_intro_context) as f:
+                    _intro_context = f.read().strip()
+            elif not _intro_context and auto_story_path:
+                with open(auto_story_path) as f:
+                    _intro_context = f.read().strip()
+
+            from intro import build_intro_beat
+
+            step_start = time.time()
+            print(f"[intro] start at {_ts()}...")
+            intro_beat = build_intro_beat(
+                source_scenes=source_scenes_pool,
+                story_context=_intro_context or "",
+                api_key=args.deepseek_key,
+                fps=args.fps,
+                scene_count=args.intro_scenes,
+            )
+            if intro_beat:
+                clustered_scenes = [intro_beat] + clustered_scenes
+                clustered["scenes"] = clustered_scenes
+                with open(clustered_storyboard_path, "w") as f:
+                    json.dump(clustered, f, indent=2)
+                print(
+                    f"[intro] prepended intro beat ({len(intro_beat['scenes'])} scenes, "
+                    f"{intro_beat['displayFrames']} frames) — \"{intro_beat['narratedText']}\""
+                )
+            else:
+                print("[intro] skipped — no source scenes available")
+            print(f"[intro] done at {_ts()} — elapsed {_elapsed(step_start)}")
+
     # Step 3: Narration (optional)
-    narrated_storyboard_path = os.path.join(run_dir, "storyboard_narrated.json")
     narration_meta: dict[int, dict] = {}
 
     if args.narrate:
@@ -477,63 +661,88 @@ def main():
                 story_context = f.read().strip()
             print(f"[narrate] loaded story context from {auto_story_path} ({len(story_context)} chars)")
 
-        from narrate import narrate as do_narrate
+        from narrate import narrate_beats as do_narrate
 
         step_start = time.time()
-        print(f"[narrate] start at {_ts()} ({len(storyboard.get('scenes', []))} scenes)...")
-        storyboard = do_narrate(
-            storyboard_path=storyboard_path,
+        print(f"[narrate_beats] start at {_ts()} ({len(clustered['scenes'])} beats)...")
+        clustered = do_narrate(
+            storyboard_path=clustered_storyboard_path,
             output_path=narrated_storyboard_path,
             api_key=args.deepseek_key,
             analysis_path=analysis_json,
             story_context=story_context,
             force=args.narrate_force,
         )
-        print(f"[narrate] done at {_ts()} — elapsed {_elapsed(step_start)}")
+        print(f"[narrate_beats] done at {_ts()} — elapsed {_elapsed(step_start)}")
+        storyboard = clustered
         storyboard_path = narrated_storyboard_path
 
-        for scene in storyboard["scenes"]:
-            narration_meta[scene["window"]] = {
-                "narratedText": scene.get("narratedText", ""),
-                "importanceScore": scene.get("importanceScore"),
-            }
-
-    # Step 3b: Story coherence evaluation (optional, runs when --narrate is active)
-    if args.narrate and not args.no_evaluate:
-        from evaluate import evaluate as do_evaluate
-
-        evaluated_storyboard_path = os.path.join(run_dir, "storyboard_evaluated.json")
-        storyboard = do_evaluate(
-            storyboard_path=storyboard_path,
-            output_path=evaluated_storyboard_path,
-            api_key=args.deepseek_key,
-            force=args.narrate_force,
-        )
-        storyboard_path = evaluated_storyboard_path
-
-        for scene in storyboard["scenes"]:
-            narration_meta[scene["window"]] = {
-                "narratedText": scene.get("narratedText", ""),
-                "importanceScore": scene.get("importanceScore"),
-            }
+    # Step 3b: Validate narration — every beat must have narratedText before TTS
+    if args.narrate:
+        from narrate import narrate_beats as do_narrate
+        
+        for retry in range(2):
+            missing = [i for i, b in enumerate(clustered["scenes"]) if not b.get("narratedText")]
+            if not missing:
+                break
+            
+            if retry == 0:
+                # First retry: re-narrate everything
+                print(f"[validate] {len(missing)}/{len(clustered['scenes'])} beats missing narration → full re-narrate")
+                clustered = do_narrate(
+                    storyboard_path=narrated_storyboard_path,
+                    output_path=narrated_storyboard_path,
+                    api_key=args.deepseek_key,
+                    analysis_path=analysis_json,
+                    story_context=story_context,
+                    force=True,
+                )
+            else:
+                # Second retry: narrate only missing beats individually via LLM
+                print(f"[validate] {len(missing)} beats still missing → individual retry: {missing}")
+                for idx in missing:
+                    from narrate import _http_post, NARRATE_BATCH_SYSTEM, _parse_batch_response
+                    beat = clustered["scenes"][idx]
+                    pov = beat.get("povText", "").strip()
+                    dialogue = beat.get("dialogue", "").strip()
+                    
+                    pct = int(round(beat.get("startSec", 0) / max(b.get("endSec", 1) for b in clustered["scenes"]) * 100))
+                    user_prompt = f"Beat to narrate:\n[Beat] pos={pct}% visual: {pov[:300]}"
+                    if dialogue:
+                        user_prompt += f" dialogue: {dialogue[:200]}"
+                    
+                    result = _http_post(args.deepseek_key, [
+                        {"role": "system", "content": NARRATE_BATCH_SYSTEM},
+                        {"role": "user", "content": user_prompt},
+                    ], max_tokens=100, temperature=0.5, timeout=60, thinking_enabled=False, json_mode=True)
+                    
+                    narrations = _parse_batch_response(result, 1)
+                    if narrations:
+                        clustered["scenes"][idx]["narratedText"] = narrations[0].strip()
+                        print(f"    beat {idx+1:02d}: {narrations[0][:60]}...")
+        
+        missing = [i for i, b in enumerate(clustered["scenes"]) if not b.get("narratedText")]
+        if missing:
+            print(f"[error] {len(missing)} beats still without narration. Cannot proceed with TTS.", file=sys.stderr)
+            print(f"  Beat indices: {missing}", file=sys.stderr)
+            sys.exit(1)
+        
+        storyboard = clustered
+        storyboard_path = narrated_storyboard_path
 
     # Step 4: TTS (enabled by default, use --no-tts to skip)
     if not args.no_tts:
         from tts import generate_batch
 
-        _qwen3_model_path = os.path.join(PROJECT_ROOT, "models", "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit")
+        _qwen3_model_path = os.path.join(PROJECT_ROOT, "models", "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16")
         if not os.path.exists(_qwen3_model_path):
             print(f"[error] Qwen3 model not found at {_qwen3_model_path!r}. "
                   f"Download it to the models/ directory.", file=sys.stderr)
             sys.exit(1)
 
-        # Default voice design for cinematic thriller narration
-        # Guidelines: specific, multidimensional, objective, original, concise
-        # Dimensions: gender, age, pitch, pace, emotion, characteristics, purpose
-        # Speed: 1.3x = brisk, efficient delivery for recap pacing
         _qwen3_instruct = (
             "A middle-aged male voice with a deep, low-pitched tone and magnetic quality. "
-            "Brisk, efficient pace at 1.3x speed for recap narration. "
+            "Steady documentary pace suited to recap narration. "
             "Rich vocal texture, serious yet calm emotional register. "
             "Ideal for documentary narration and thriller storytelling."
         )
@@ -551,36 +760,66 @@ def main():
         generate_batch(storyboard["scenes"], voiceover_dir, **tts_kwargs)
         print(f"[tts] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
-        # Persist ttsText (stamped in-place by generate_batch) into the evaluated storyboard
-        tts_storyboard_path = os.path.join(run_dir, "storyboard_tts.json")
+        # Beats produced by cluster.py have no `window` field. Assign window=i+1
+        # so `adjust_display_frames_to_audio` (and downstream Zod validation) can
+        # locate each beat's `scene_NN.mp3` file.
+        for i, scene in enumerate(storyboard["scenes"]):
+            scene.setdefault("window", i + 1)
+
+        # Final sync guard: clamp each beat's displayFrames to its actual TTS
+        # audio duration + 0.4s padding so visuals end with the narration.
+        adjust_display_frames_to_audio(storyboard, voiceover_dir, args.fps)
+
+        # Step 4b: Align scene cuts to narration phrases via STT (per beat).
+        # Replaces the placeholder/cluster-based segments with phrase-aligned
+        # ones whose timing comes from word-level Whisper timestamps.
+        if not args.no_align:
+            if not args.deepseek_key:
+                print("[align] skipping — DeepSeek key required for phrase matching (or pass --no-align)")
+            else:
+                from align import align_beats
+
+                step_start = time.time()
+                print(f"[align] start at {_ts()}...")
+                align_beats(
+                    storyboard["scenes"],
+                    source_scenes=source_scenes_pool,
+                    voiceover_dir=voiceover_dir,
+                    api_key=args.deepseek_key,
+                    fps=args.fps,
+                    expand=args.align_expand,
+                    whisper_model_size=args.align_whisper_model,
+                )
+                print(f"[align] done at {_ts()} — elapsed {_elapsed(step_start)}")
+
+        # Persist ttsText (stamped in-place by generate_batch) plus the adjusted
+        # display frames. Re-write storyboard_path too so the render-prep block
+        # below picks up the synced durations when it reloads from disk.
         with open(tts_storyboard_path, "w") as f:
+            json.dump(storyboard, f, indent=2)
+        with open(storyboard_path, "w") as f:
             json.dump(storyboard, f, indent=2)
         print(f"[tts] storyboard with ttsText → {tts_storyboard_path}")
 
-        storyboard = do_transform(
-            analysis_path=analysis_json,
-            output_path=storyboard_path,
-            video_path=video_path,
-            fps=args.fps,
-            recap_ratio=args.recap_ratio,
-            voiceover_dir=voiceover_dir,
-        )
-
-        for scene in storyboard["scenes"]:
-            meta = narration_meta.get(scene["window"])
-            if meta:
-                if meta.get("narratedText"):
-                    scene["narratedText"] = meta["narratedText"]
-                if meta.get("importanceScore") is not None:
-                    scene["importanceScore"] = meta["importanceScore"]
-
-        adjust_display_frames_to_audio(storyboard, voiceover_dir, args.fps)
-
-        with open(storyboard_path, "w") as f:
-            json.dump(storyboard, f, indent=2)
-
     # Step 5: Place video + voiceovers in remotion/public/
     setup_remotion_public(video_path, voiceover_dir=voiceover_dir)
+
+    # Step 5b: Prepare beats for Remotion render (add window field for Zod validation)
+    if os.path.exists(clustered_storyboard_path):
+        with open(storyboard_path) as f:
+            render_storyboard = json.load(f)
+        for i, beat in enumerate(render_storyboard["scenes"]):
+            vo_path = f"voiceover/scene_{i+1:02d}.mp3"
+            real_path = os.path.join(run_dir, vo_path)
+            if os.path.exists(real_path):
+                beat["voiceoverPath"] = vo_path
+            # Ensure required fields for Zod: window, endSec, durationInFrames, startFmt
+            beat["window"] = i + 1
+            beat["endSec"] = beat.get("endSec", beat.get("startSec", 0) + beat.get("displayFrames", 30) / args.fps)
+            beat["durationInFrames"] = beat.get("durationInFrames", beat.get("displayFrames", 30))
+            beat["startFmt"] = beat.get("startFmt", "")
+            beat["dialog"] = beat.get("dialogue", "")
+        print(f"[render] rendering {len(render_storyboard['scenes'])} beats")
 
     # Step 6: Install Node deps
     install_remotion_deps()
@@ -588,7 +827,7 @@ def main():
     # Step 7: Render
     step_start = time.time()
     print(f"[render] start at {_ts()}...")
-    run_render(storyboard, output_mp4, concurrency=args.concurrency, gl=args.gl)
+    run_render(render_storyboard, output_mp4, concurrency=args.concurrency, gl=args.gl)
     print(f"[render] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
     pipeline_elapsed = _elapsed(pipeline_start)

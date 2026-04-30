@@ -51,7 +51,7 @@ def generate_qwen3_tts(
 
     tmp_dir = tempfile.mkdtemp(prefix="qwen3tts_")
     try:
-        # Always use voice design mode (instruct-only, no speaker)
+        # Use voice design mode (instruct-only for VoiceDesign model)
         generate_audio(
             model=model,
             text=text,
@@ -126,7 +126,12 @@ def _transcribe_word_timestamps(mp3_path: str) -> list[dict]:
 
 
 def _scene_text(scene: dict) -> str:
-    return scene.get("narratedText") or scene.get("povText") or scene.get("description", "")
+    # Priority: narratedText (what the narrator should say) > ttsText > povText > description
+    text = scene.get("narratedText") or scene.get("ttsText") or ""
+    if text.strip():
+        return text.strip()
+    # Fallback only if no narration at all (shouldn't happen in normal flow)
+    return scene.get("povText") or scene.get("description", "")
 
 
 def _proportional_boundaries(scenes: list[dict], audio_duration: float) -> list[float]:
@@ -376,7 +381,8 @@ def generate_batch(
 
     window_to_path: dict[int, str] = {}
     for i, scene in enumerate(scenes_with_text):
-        w = scene["window"]
+        # Support both scenes (window key) and beats (no window key, use index)
+        w = scene.get("window", i + 1)
         text = _scene_text(scene)
         wc = _count_words(text)
         out_path = os.path.join(voiceover_dir, f"scene_{w:02d}.mp3")
@@ -398,9 +404,9 @@ def generate_batch(
             manifest = {
                 "totalWords": total_words,
                 "scenes": [
-                    {"window": s["window"], "ttsText": _scene_text(s),
-                     "audioPath": f"scene_{s['window']:02d}.mp3"}
-                    for s in scenes_with_text[:i+1]
+                    {"window": s.get("window", idx + 1), "ttsText": _scene_text(s),
+                     "audioPath": f"scene_{s.get('window', idx + 1):02d}.mp3"}
+                    for idx, s in enumerate(scenes_with_text[:i+1])
                 ],
             }
             manifest_path = os.path.join(voiceover_dir, "tts_manifest.json")
@@ -416,9 +422,9 @@ def generate_batch(
     manifest = {
         "totalWords": total_words,
         "scenes": [
-            {"window": s["window"], "ttsText": _scene_text(s),
-             "audioPath": f"scene_{s['window']:02d}.mp3"}
-            for s in scenes_with_text
+            {"window": s.get("window", idx + 1), "ttsText": _scene_text(s),
+             "audioPath": f"scene_{s.get('window', idx + 1):02d}.mp3"}
+            for idx, s in enumerate(scenes_with_text)
         ],
     }
     manifest_path = os.path.join(voiceover_dir, "tts_manifest.json")
@@ -426,6 +432,6 @@ def generate_batch(
         _json.dump(manifest, f, indent=2)
     print(f"[tts] manifest → {manifest_path}")
 
-    return [window_to_path.get(s["window"], "") for s in scenes]
+    return [window_to_path.get(s.get("window", idx + 1), "") for idx, s in enumerate(scenes)]
 
 

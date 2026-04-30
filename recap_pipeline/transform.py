@@ -140,6 +140,54 @@ def transform(
     if len(scenes_raw) < len(all_scenes):
         print(f"[transform] filtered {len(all_scenes) - len(scenes_raw)} credit/title scene(s)")
 
+    # Secondary filter: catch credits/title/logo scenes the VLM mislabeled.
+    # Two layers: single phrase that is itself a smoking gun, and 2-keyword combos
+    # that together describe a credits-style frame.
+    CREDITS_PHRASES = [
+        "production logo", "production logos",
+        "title card", "title cards",
+        "opening title", "opening titles",
+        "closing credit", "closing credits",
+        "end credit", "end credits",
+        "credits roll", "credits and names",
+        "scrolling text", "rolling text",
+        "list of names", "list of cast", "text listing names",
+        "static display of text",
+        "dolby digital", "dgc", "actra", "nabet",
+    ]
+    CREDITS_COMBO = [
+        ("text", "no character"),
+        ("text", "no visible character"),
+        ("names", "no character"),
+        ("names", "no visible character"),
+        ("white text", "black"),
+        ("white text", "dark"),
+        ("static display", "text"),
+        ("scrolling", "text"),
+        ("rolling", "text"),
+        ("text overlay", "no action"),
+    ]
+
+    non_credit_scenes = []
+    phrase_drops = 0
+    combo_drops = 0
+    for s in scenes_raw:
+        desc = (s.get("description", "") + " " + s.get("povText", "")).lower()
+        if any(p in desc for p in CREDITS_PHRASES):
+            phrase_drops += 1
+            continue
+        if any(a in desc and b in desc for (a, b) in CREDITS_COMBO):
+            combo_drops += 1
+            continue
+        non_credit_scenes.append(s)
+
+    if len(non_credit_scenes) < len(scenes_raw):
+        print(
+            f"[transform] secondary filter removed {len(scenes_raw) - len(non_credit_scenes)} scenes "
+            f"(CREDITS_PHRASES={phrase_drops}, CREDITS_COMBO={combo_drops})"
+        )
+        scenes_raw = non_credit_scenes
+
     display_secs_list = compute_display_secs(scenes_raw, recap_ratio)
 
     total_original = sum(
