@@ -348,3 +348,87 @@ def align_beats(
         f"single-phrase fallbacks {fallback_count} — elapsed {time.time() - started:.1f}s"
     )
     return beats
+
+
+def align_single_beat(
+    beat: dict,
+    source_scenes: list[dict],
+    voiceover_dir: str,
+    api_key: str,
+    fps: int,
+    expand: int = 2,
+    whisper=None,           # pre-loaded faster-whisper model
+) -> dict:
+    """Re-align a single beat after narration or scene swap.
+
+    If ``whisper`` is not provided, loads a new tiny.en model. Returns the
+    updated beat dict with fresh ``segments`` attached.
+    """
+    if whisper is None:
+        whisper = _load_whisper("tiny.en")
+
+    text = (beat.get("ttsText") or beat.get("narratedText") or "").strip()
+    window = beat.get("window", 0)
+    mp3 = os.path.join(voiceover_dir, f"scene_{window:02d}.mp3")
+
+    if not text or not os.path.exists(mp3):
+        return beat
+
+    if beat.get("isIntro"):
+        return beat
+
+    try:
+        stt_words = transcribe_words(mp3, whisper)
+    except Exception as e:
+        print(f"  [align-single] beat {window:02d} STT failed ({e})")
+        return beat
+
+    beat_total_frames = int(beat.get("displayFrames") or 0)
+    if beat_total_frames <= 0:
+        return beat
+
+    audio_secs = beat_total_frames / fps
+    phrases = split_phrases(text)
+    if not phrases:
+        return beat
+
+    phrase_times = map_phrases_to_times(phrases, stt_words, audio_secs)
+
+    # Build candidate pool
+    source_index = {s["window"]: s for s in source_scenes if "window" in s}
+    source_order = [s["window"] for s in source_scenes if "window" in s]
+    candidates = _candidate_pool(beat, source_index, source_order, expand)
+
+    if not candidates:
+        return beat
+
+    chosen_idxs: list[int]
+    if len(phrases) == 1 or len(candidates) == 1:
+        chosen_idxs = [0] * len(phrases)
+    else:
+        chosen_idxs = llm_match_phrases(
+            phrases, candidates, api_key, beat_label=f"{window:02d}"
+        )
+
+    # Build segments
+    segments: list[dict] = []
+    cum_frames = 0
+    for k, ((p_start, p_end), idx) in enumerate(zip(phrase_times, chosen_idxs)):
+        seg_secs = max(0.5, p_end - p_start)
+        seg_frames = max(1, round(seg_secs * fps))
+        chosen = candidates[idx]
+        segments.append({
+            "startSec": float(chosen.get("startSec", 0.0)),
+            "displayFrames": seg_frames,
+            "sourceWindow": int(chosen.get("window", -1)),
+            "phrase": phrases[k],
+        })
+        cum_frames += seg_frames
+
+    if segments:
+        diff = beat_total_frames - cum_frames
+        if diff != 0:
+            segments[-1]["displayFrames"] = max(1, segments[-1]["displayFrames"] + diff)
+
+    beat["segments"] = segments
+    return beat

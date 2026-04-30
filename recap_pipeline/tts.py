@@ -34,14 +34,16 @@ def generate_qwen3_tts(
     # - Be concise: under 2048 chars, every word adds meaning
     # - Supported: Chinese and English only
     instruct: str = (
-        "A middle-aged male voice with a deep, low-pitched tone and magnetic quality. "
-        "Brisk, efficient pace at 1.3x speed for recap narration. "
-        "Rich vocal texture, serious yet calm emotional register. "
-        "Ideal for documentary narration and thriller storytelling."
+        "A young adult male voice with a smooth, warm, and slightly deeper tone. "
+        "Expressive, dynamic delivery with natural variation in pitch and rhythm — "
+        "rising for tension, falling for resolution, pausing between ideas. "
+        "Clear natural pauses at commas and periods, as if speaking to one person. "
+        "Warm yet gripping emotional range, shifting intensity with the story. "
+        "Ideal for cinematic documentary narration with emotional engagement."
     ),
     speed: float = 1.0,
     sample_rate: int = 24000,
-    temperature: float = 0.3,       # lower = more consistent voice across scenes
+    temperature: float = 0.7,       # higher = more dynamic variation across phrases
     max_tokens: int = 2048,         # 400 words ~1200 tokens; leave headroom
 ) -> None:
     try:

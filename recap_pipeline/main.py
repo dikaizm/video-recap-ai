@@ -408,7 +408,16 @@ def main():
                         help="Remotion WebGL backend: angle (default, Metal on macOS), swiftshader, egl")
     parser.add_argument("--output", default=None, help="Output MP4 path (default: output/<video>_<timestamp>/recap.mp4)")
     parser.add_argument("--render-height", type=int, default=None, help="Downscale output to this height in pixels (e.g. 480). Width is scaled proportionally.")
+    parser.add_argument("--agent", action="store_true", help="Enable agent self-review loop after initial render")
+    parser.add_argument("--agent-max-iter", type=int, default=3, help="Maximum self-improvement iterations (default: 3)")
+    parser.add_argument("--agent-threshold", type=float, default=0.85, help="Stop when this fraction of beats score 4+ (default: 0.85)")
+    parser.add_argument("--agent-no-render", action="store_true", help="Skip re-render during agent loop (eval only)")
     args = parser.parse_args()
+
+    # Agent loop: delegate to agent.py and exit early
+    if args.agent:
+        from agent import run_agent_loop
+        sys.exit(run_agent_loop(args))
 
     pipeline_start = time.time()
 
@@ -740,16 +749,8 @@ def main():
                   f"Download it to the models/ directory.", file=sys.stderr)
             sys.exit(1)
 
-        _qwen3_instruct = (
-            "A middle-aged male voice with a deep, low-pitched tone and magnetic quality. "
-            "Steady documentary pace suited to recap narration. "
-            "Rich vocal texture, serious yet calm emotional register. "
-            "Ideal for documentary narration and thriller storytelling."
-        )
-
         tts_kwargs: dict = {
             "model_path": _qwen3_model_path,
-            "instruct": _qwen3_instruct,
             "speed": args.qwen3_speed,
         }
         if args.deepseek_key:
