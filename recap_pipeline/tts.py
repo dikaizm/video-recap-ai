@@ -34,12 +34,12 @@ def generate_qwen3_tts(
     # - Be concise: under 2048 chars, every word adds meaning
     # - Supported: Chinese and English only
     instruct: str = (
-        "A young adult male voice with a smooth, warm, and slightly deeper tone. "
-        "Expressive, dynamic delivery with natural variation in pitch and rhythm — "
-        "rising for tension, falling for resolution, pausing between ideas. "
-        "Clear natural pauses at commas and periods, as if speaking to one person. "
-        "Warm yet gripping emotional range, shifting intensity with the story. "
-        "Ideal for cinematic documentary narration with emotional engagement."
+        "A young adult male voice, mid-twenties, with a soft and warm tone. "
+        "Light, gentle timbre — smooth and approachable, never harsh or booming. "
+        "Measured, calm delivery with natural pauses at commas and periods. "
+        "Subtle dynamic range: slightly more intense for tension, softer for resolution. "
+        "Intimate, conversational quality — as if speaking directly to one listener. "
+        "Ideal for documentary narration: clear, soft, and engaging throughout."
     ),
     speed: float = 1.0,
     sample_rate: int = 24000,

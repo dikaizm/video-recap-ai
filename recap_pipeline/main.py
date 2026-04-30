@@ -416,6 +416,9 @@ def main():
 
     # Agent loop: delegate to agent.py and exit early
     if args.agent:
+        # Agent always enables narration and TTS
+        args.narrate = True
+        args.no_tts = False
         from agent import run_agent_loop
         sys.exit(run_agent_loop(args))
 

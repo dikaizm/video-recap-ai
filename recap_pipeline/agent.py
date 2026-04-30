@@ -239,6 +239,233 @@ def self_correct(
     return storyboard, changed_beats
 
 
+def _run_pipeline(args, run_dir: str, video_path: str, auto_story: str | None) -> None:
+    """Run all pipeline steps directly, producing output in run_dir."""
+    from transform import transform as do_transform
+    from cluster import cluster_scenes
+    from tts import generate_batch
+    from main import (
+        setup_remotion_public, install_remotion_deps, run_render,
+        adjust_display_frames_to_audio, setup_run_logging, _stream_subprocess,
+    )
+
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+    REMOTION_DIR = os.path.join(PROJECT_ROOT, "remotion")
+
+    fps = getattr(args, "fps", 30)
+    recap_ratio = getattr(args, "recap_ratio", 0.15)
+    ollama_model = getattr(args, "ollama_model", "gemma4:e2b")
+    ollama_host = getattr(args, "ollama_host", "http://localhost:11434")
+    decode_height = getattr(args, "decode_height", 640)
+    deepseek_key = getattr(args, "deepseek_key", "")
+    qwen3_speed = getattr(args, "qwen3_speed", 1.0)
+
+    voiceover_dir = os.path.join(run_dir, "voiceover") if not getattr(args, "no_tts", False) else None
+    storyboard_path = os.path.join(run_dir, "storyboard.json")
+    narrated_path = os.path.join(run_dir, "storyboard_narrated.json")
+    clustered_path = os.path.join(run_dir, "storyboard_clustered.json")
+    analysis_json = os.path.join(run_dir, "analysis.json")
+    output_mp4 = os.path.join(run_dir, "recap.mp4")
+
+    setup_run_logging(run_dir)
+
+    # Step 1: Analysis (via analyze.py subprocess — it has complex frame extraction)
+    step_start = time.time()
+    print(f"[pipeline] step 1: analysis...")
+    cmd = [
+        sys.executable, os.path.join(PACKAGE_DIR, "analyze.py"),
+        "--video", video_path,
+        "--output", analysis_json,
+        "--ollama-model", ollama_model,
+        "--ollama-host", ollama_host,
+    ]
+    if decode_height > 0:
+        cmd += ["--decode-height", str(decode_height)]
+    _stream_subprocess(cmd, cwd=PROJECT_ROOT)
+    print(f"[pipeline] analysis done ({time.time() - step_start:.0f}s)")
+
+    # Step 2: Transform
+    step_start = time.time()
+    print(f"[pipeline] step 2: transform...")
+    storyboard = do_transform(
+        analysis_path=analysis_json,
+        output_path=storyboard_path,
+        video_path=video_path,
+        fps=fps,
+        recap_ratio=recap_ratio,
+        voiceover_dir=voiceover_dir,
+    )
+    print(f"[pipeline] transform done ({time.time() - step_start:.0f}s)")
+
+    # Step 3: Cluster
+    step_start = time.time()
+    print(f"[pipeline] step 3: cluster...")
+    target_duration = sum(s["displayFrames"] for s in storyboard["scenes"]) / fps
+    source_scenes_pool = list(storyboard["scenes"])
+    clustered_scenes = cluster_scenes(
+        storyboard["scenes"],
+        target_duration=target_duration,
+        fps=fps,
+        min_beat_sec=getattr(args, "min_beat_sec", 4.0),
+        max_beat_sec=getattr(args, "max_beat_sec", 8.0),
+    )
+    clustered = {**storyboard, "scenes": clustered_scenes}
+    with open(clustered_path, "w") as f:
+        json.dump(clustered, f, indent=2)
+    print(f"[pipeline] cluster done ({time.time() - step_start:.0f}s)")
+
+    # Step 4: Intro
+    if not getattr(args, "no_intro", False) and getattr(args, "narrate", True) and deepseek_key:
+        from intro import build_intro_beat
+        step_start = time.time()
+        print(f"[pipeline] step 4: intro...")
+        story_text = ""
+        if auto_story and os.path.isfile(auto_story):
+            with open(auto_story) as f:
+                story_text = f.read().strip()
+        intro_beat = build_intro_beat(
+            source_scenes=source_scenes_pool,
+            story_context=story_text,
+            api_key=deepseek_key,
+            fps=fps,
+            scene_count=getattr(args, "intro_scenes", 3),
+        )
+        if intro_beat:
+            clustered_scenes = [intro_beat] + clustered_scenes
+            clustered["scenes"] = clustered_scenes
+            with open(clustered_path, "w") as f:
+                json.dump(clustered, f, indent=2)
+            print(f"[pipeline] intro done ({time.time() - step_start:.0f}s)")
+
+    # Step 5: Narrate
+    if getattr(args, "narrate", False) and deepseek_key:
+        from narrate import narrate_beats, _http_post, NARRATE_BATCH_SYSTEM, _parse_batch_response
+        step_start = time.time()
+        print(f"[pipeline] step 5: narrate...")
+
+        story_context = ""
+        if auto_story and os.path.isfile(auto_story):
+            with open(auto_story) as f:
+                story_context = f.read().strip()
+
+        clustered = narrate_beats(
+            storyboard_path=clustered_path,
+            output_path=narrated_path,
+            api_key=deepseek_key,
+            analysis_path=analysis_json,
+            story_context=story_context,
+            force=getattr(args, "narrate_force", False),
+        )
+        storyboard = clustered
+
+        # Validation retry
+        for retry in range(2):
+            missing = [i for i, b in enumerate(clustered["scenes"]) if not b.get("narratedText")]
+            if not missing:
+                break
+            if retry == 0:
+                print(f"[validate] {len(missing)}/{len(clustered['scenes'])} beats missing → full re-narrate")
+                clustered = narrate_beats(
+                    storyboard_path=narrated_path,
+                    output_path=narrated_path,
+                    api_key=deepseek_key,
+                    analysis_path=analysis_json,
+                    story_context=story_context,
+                    force=True,
+                )
+            else:
+                print(f"[validate] {len(missing)} beats still missing → individual retry")
+                for idx in missing:
+                    beat = clustered["scenes"][idx]
+                    pov = beat.get("povText", "").strip()
+                    dialogue = beat.get("dialogue", "").strip()
+                    total_sec = max(b.get("endSec", 1) for b in clustered["scenes"])
+                    pct = int(round(beat.get("startSec", 0) / max(1, total_sec) * 100))
+                    user = f"Beat to narrate:\n[Beat] pos={pct}% visual: {pov[:300]}"
+                    if dialogue:
+                        user += f" dialogue: {dialogue[:200]}"
+                    result = _http_post(deepseek_key, [
+                        {"role": "system", "content": NARRATE_BATCH_SYSTEM},
+                        {"role": "user", "content": user},
+                    ], max_tokens=100, temperature=0.5, timeout=60, thinking_enabled=False, json_mode=True)
+                    narrations = _parse_batch_response(result, 1)
+                    if narrations:
+                        clustered["scenes"][idx]["narratedText"] = narrations[0].strip()
+
+        missing = [i for i, b in enumerate(clustered["scenes"]) if not b.get("narratedText")]
+        if missing:
+            print(f"[error] {len(missing)} beats still without narration", file=sys.stderr)
+            sys.exit(1)
+
+        with open(narrated_path, "w") as f:
+            json.dump(clustered, f, indent=2)
+        storyboard = clustered
+        storyboard_path = narrated_path
+        print(f"[pipeline] narrate done ({time.time() - step_start:.0f}s)")
+
+    # Step 6: TTS
+    if not getattr(args, "no_tts", False):
+        from tts import generate_batch
+        step_start = time.time()
+        print(f"[pipeline] step 6: TTS...")
+
+        _qwen3_model_path = os.path.join(PROJECT_ROOT, "models", "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16")
+        if not os.path.exists(_qwen3_model_path):
+            print(f"[error] Qwen3 model not found at {_qwen3_model_path!r}", file=sys.stderr)
+            sys.exit(1)
+
+        tts_kwargs = {
+            "model_path": _qwen3_model_path,
+            "speed": qwen3_speed,
+        }
+        generate_batch(storyboard["scenes"], voiceover_dir, **tts_kwargs)
+        print(f"[pipeline] TTS done ({time.time() - step_start:.0f}s)")
+
+        for i, scene in enumerate(storyboard["scenes"]):
+            scene.setdefault("window", i + 1)
+
+        adjust_display_frames_to_audio(storyboard, voiceover_dir, fps)
+
+        # Step 7: Align
+        if not getattr(args, "no_align", False) and deepseek_key:
+            from align import align_beats
+            step_start = time.time()
+            print(f"[pipeline] step 7: align...")
+            align_beats(
+                storyboard["scenes"],
+                source_scenes=source_scenes_pool,
+                voiceover_dir=voiceover_dir,
+                api_key=deepseek_key,
+                fps=fps,
+                expand=getattr(args, "align_expand", 2),
+                whisper_model_size=getattr(args, "align_whisper_model", "tiny.en"),
+            )
+            print(f"[pipeline] align done ({time.time() - step_start:.0f}s)")
+
+        with open(storyboard_path, "w") as f:
+            json.dump(storyboard, f, indent=2)
+
+    # Step 8: Render
+    setup_remotion_public(video_path, voiceover_dir=voiceover_dir)
+    beats_list = storyboard["scenes"]
+    for i, beat in enumerate(beats_list):
+        vo_path = f"voiceover/scene_{i + 1:02d}.mp3"
+        if os.path.exists(os.path.join(run_dir, vo_path)):
+            beat["voiceoverPath"] = vo_path
+        beat["window"] = i + 1
+        beat["endSec"] = beat.get("endSec", beat.get("startSec", 0) + beat.get("displayFrames", 30) / fps)
+        beat["durationInFrames"] = beat.get("durationInFrames", beat.get("displayFrames", 30))
+        beat["startFmt"] = beat.get("startFmt", "")
+        beat["dialog"] = beat.get("dialogue", "")
+
+    install_remotion_deps()
+    step_start = time.time()
+    print(f"[pipeline] step 8: render...")
+    run_render(storyboard, output_mp4, concurrency=getattr(args, "concurrency", None), gl=getattr(args, "gl", "angle"))
+    print(f"[pipeline] render done ({time.time() - step_start:.0f}s)")
+
+
 def run_agent_loop(
     args,
 ) -> int:
@@ -288,42 +515,8 @@ def run_agent_loop(
     print(f"[agent] ITERATION 0: producing initial recap")
     print(f"{'=' * 60}")
 
-    # Build main.py command with all args forwarded
-    cmd = [sys.executable, os.path.join(PACKAGE_DIR, "main.py")]
-    if args.input:
-        cmd += ["--input", args.input]
-    else:
-        cmd += ["--video", args.video]
-    cmd += [
-        "--ollama-model", getattr(args, "ollama_model", "gemma4:e2b"),
-        "--ollama-host", getattr(args, "ollama_host", "http://localhost:11434"),
-        "--recap-ratio", str(getattr(args, "recap_ratio", 0.15)),
-        "--fps", str(getattr(args, "fps", 30)),
-        "--narrate",
-        "--no-evaluate",
-        "--qwen3-speed", str(getattr(args, "qwen3_speed", 1.0)),
-        "--max-beat-sec", str(getattr(args, "max_beat_sec", 8.0)),
-        "--min-beat-sec", str(getattr(args, "min_beat_sec", 4.0)),
-        "--output", output_mp4,
-    ]
-    if getattr(args, "decode_height", 0):
-        cmd += ["--decode-height", str(args.decode_height)]
-    if getattr(args, "no_intro", False):
-        cmd += ["--no-intro"]
-    if getattr(args, "no_align", False):
-        cmd += ["--no-align"]
-    if getattr(args, "narrate_force", False):
-        cmd += ["--narrate-force"]
-    if getattr(args, "deepseek_key"):
-        cmd += ["--deepseek-key", args.deepseek_key]
-    if auto_story:
-        cmd += ["--story-context", auto_story]
-
-    print(f"[agent] running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT)
-    if result.returncode != 0:
-        print("[agent] initial pipeline failed", file=sys.stderr)
-        return 1
+    # Run pipeline steps directly (avoids subprocess directory mismatch)
+    _run_pipeline(args, run_dir, video_path, auto_story)
 
     # --- Iteration loop ---
     for iteration in range(1, max_iter + 1):
