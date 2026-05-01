@@ -673,23 +673,23 @@ def main():
 
     # Step 3: Narration (optional)
     narration_meta: dict[int, dict] = {}
-    story_context: str | None = None  # resolved below if --narrate
+
+    # Resolve story context once — used by narration, genre detection, and metadata gen
+    story_context: str | None = args.story_context
+    if story_context and os.path.isfile(story_context):
+        with open(story_context) as f:
+            story_context = f.read().strip()
+    elif not story_context and auto_story_path:
+        with open(auto_story_path) as f:
+            story_context = f.read().strip()
 
     if args.narrate:
         if not args.deepseek_key:
             print("[error] --deepseek-key required for narration (or set DEEPSEEK_API_KEY)", file=sys.stderr)
             sys.exit(1)
 
-        # Resolve story context: --story-context takes precedence, then auto-detected story file
-        story_context = args.story_context
-        if story_context and os.path.isfile(story_context):
-            with open(story_context) as f:
-                story_context = f.read().strip()
-            print(f"[narrate] loaded story context from --story-context ({len(story_context)} chars)")
-        elif not story_context and auto_story_path:
-            with open(auto_story_path) as f:
-                story_context = f.read().strip()
-            print(f"[narrate] loaded story context from {auto_story_path} ({len(story_context)} chars)")
+        if story_context:
+            print(f"[narrate] story context: {len(story_context)} chars")
 
         from narrate import narrate_beats as do_narrate
 
@@ -948,6 +948,23 @@ def main():
     print(f"[pipeline] ALL DONE at {_ts()} — total elapsed {pipeline_elapsed}")
     print(f"[pipeline] output → {output_mp4}")
     print(f"{'='*60}")
+
+    # Step 9: Generate YouTube metadata (title, description, hashtags)
+    if args.deepseek_key:
+        from metadata_gen import generate_video_metadata
+        meta_path = os.path.join(run_dir, f"{run_name}_metadata.md")
+        try:
+            generate_video_metadata(
+                storyboard=render_storyboard,
+                movie_title=run_name.replace("-", " ").replace("_", " "),
+                api_key=args.deepseek_key,
+                story_context=story_context or "",
+                output_path=meta_path,
+            )
+        except Exception as e:
+            print(f"[metadata] failed: {e}", file=sys.stderr)
+    else:
+        print("[metadata] skipped — no DeepSeek key (pass --deepseek-key to generate)")
 
     # Optional: downscale to target height
     if args.render_height:
