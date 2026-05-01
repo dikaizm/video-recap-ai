@@ -10,13 +10,17 @@ type Props = {
 export const MovieRecap: React.FC<Props> = ({ storyboard }) => {
   return (
     <Series>
-      {storyboard.scenes.map((scene) => (
+      {storyboard.scenes.map((scene, index) => (
         <Series.Sequence
           key={scene.window}
           durationInFrames={scene.displayFrames}
           layout="none"
         >
-          <SceneComponent {...scene} videoSrc={storyboard.videoPath} />
+          <SceneComponent
+            {...scene}
+            videoSrc={storyboard.videoPath}
+            isFirstScene={index === 0}
+          />
         </Series.Sequence>
       ))}
     </Series>

@@ -8,7 +8,7 @@ export const SceneSegmentSchema = z.object({
 });
 
 export const SceneSchema = z.object({
-  window: z.number().int().positive(),
+  window: z.number().int().nonnegative(),
   startSec: z.number().nonnegative(),
   endSec: z.number().positive(),
   durationInFrames: z.number().int().positive(),
@@ -16,9 +16,11 @@ export const SceneSchema = z.object({
   povText: z.string(),
   dialogue: z.string(),
   voiceoverPath: z.string().optional(),
-  startFmt: z.string(),
+  startFmt: z.string().optional().default(""),
   segments: z.array(SceneSegmentSchema).optional(),
   isIntro: z.boolean().optional(),
+  isGreeting: z.boolean().optional(),
+  channelName: z.string().optional(),
 });
 
 export const StoryboardSchema = z.object({

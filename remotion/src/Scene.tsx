@@ -2,6 +2,8 @@ import React from "react";
 import {
   AbsoluteFill,
   Audio,
+  Img,
+  interpolate,
   OffthreadVideo,
   Series,
   spring,
@@ -10,8 +12,58 @@ import {
   useVideoConfig,
 } from "remotion";
 import { type Scene, type SceneSegment } from "./schemas";
+import { GreetingCard } from "./GreetingCard";
 
-type Props = Scene & { videoSrc: string };
+type Props = Scene & { videoSrc: string; isFirstScene?: boolean };
+
+const LogoOverlay: React.FC<{ isFirstScene?: boolean }> = ({ isFirstScene }) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+
+  // Only show logo on first scene
+  if (!isFirstScene) {
+    return null;
+  }
+
+  // Fade out after 15 seconds (only for first scene)
+  const fadeOutStartFrame = 15 * fps; // 15 seconds
+  const fadeOutEndFrame = fadeOutStartFrame + fps; // Fade over 1 second
+
+  const opacity = interpolate(
+    frame,
+    [fadeOutStartFrame, fadeOutEndFrame],
+    [0.95, 0],
+    {
+      extrapolateLeft: "clamp",
+      extrapolateRight: "clamp",
+    }
+  );
+
+  // Hide completely after fade
+  if (frame > fadeOutEndFrame) {
+    return null;
+  }
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 24,
+        left: 24,
+        zIndex: 100,
+        opacity,
+      }}
+    >
+      <Img
+        src={staticFile("Logo_PremiereRoll_circle.png")}
+        style={{
+          width: 140,
+          height: "auto",
+        }}
+      />
+    </div>
+  );
+};
 
 const VideoSegment: React.FC<{
   startSec: number;
@@ -56,7 +108,21 @@ export const SceneComponent: React.FC<Props> = ({
   segments,
   voiceoverPath,
   videoSrc,
+  isFirstScene,
+  isGreeting,
+  channelName,
 }) => {
+  // Greeting beat: branded title card, no source video
+  if (isGreeting) {
+    return (
+      <GreetingCard
+        channelName={channelName ?? "Premiere Roll"}
+        voiceoverPath={voiceoverPath}
+        displayFrames={displayFrames}
+      />
+    );
+  }
+
   const segs: SceneSegment[] =
     segments && segments.length > 0
       ? segments
@@ -81,6 +147,9 @@ export const SceneComponent: React.FC<Props> = ({
       </Series>
 
       {voiceoverPath && <Audio src={staticFile(voiceoverPath)} />}
+
+      {/* PR Logo overlay - top left corner */}
+      <LogoOverlay isFirstScene={isFirstScene} />
     </AbsoluteFill>
   );
 };
