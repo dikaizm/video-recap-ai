@@ -11,3 +11,5 @@ models/
 .DS_Store
 remotion/out/
 docs/
+**/tmp**.json
+**/latest_storyboard**.json
