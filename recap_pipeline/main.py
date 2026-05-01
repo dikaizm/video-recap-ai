@@ -53,6 +53,9 @@ if os.path.exists(_env_path):
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 
+# Import premiere export
+from premiere_export import generate_premiere_xml, generate_premiere_edl
+
 _log_file = None  # set after run_dir is created
 
 
@@ -377,8 +380,22 @@ def main():
         "--recap-ratio", type=float, default=0.15,
         help="Recap duration as fraction of original movie (default: 0.15 = 15%%)",
     )
-    parser.add_argument("--no-tts", action="store_true", help="Skip Qwen3 voiceover generation")
-    parser.add_argument("--qwen3-speed", type=float, default=1.0, help="Qwen3 speech speed (default: 1.0)")
+    parser.add_argument("--no-tts", action="store_true", help="Skip TTS voiceover generation")
+    parser.add_argument("--tts-model", default=None,
+                        help="TTS model path or HuggingFace repo ID (default: local Qwen3-TTS-12Hz model)")
+    parser.add_argument("--qwen3-speed", type=float, default=1.0, help="TTS speech speed (default: 1.0)")
+    parser.add_argument(
+        "--genre", default="auto",
+        help=(
+            "Voice preset genre: auto (detect from story context), "
+            "thriller, sci-fi, horror, action, drama, comedy, romance, fantasy, documentary "
+            "(default: auto)"
+        ),
+    )
+    parser.add_argument("--no-greeting", action="store_true",
+                        help="Skip branded channel greeting beat at the start")
+    parser.add_argument("--greeting-text", default=None,
+                        help="Override greeting text (default: built-in Premiere Roll signature)")
     parser.add_argument("--max-beat-sec", type=float, default=8.0,
                         help="Maximum beat duration in seconds (default: 8.0)")
     parser.add_argument("--min-beat-sec", type=float, default=4.0,
@@ -656,6 +673,7 @@ def main():
 
     # Step 3: Narration (optional)
     narration_meta: dict[int, dict] = {}
+    story_context: str | None = None  # resolved below if --narrate
 
     if args.narrate:
         if not args.deepseek_key:
@@ -663,7 +681,7 @@ def main():
             sys.exit(1)
 
         # Resolve story context: --story-context takes precedence, then auto-detected story file
-        story_context: str | None = args.story_context
+        story_context = args.story_context
         if story_context and os.path.isfile(story_context):
             with open(story_context) as f:
                 story_context = f.read().strip()
@@ -743,18 +761,40 @@ def main():
         storyboard_path = narrated_storyboard_path
 
     # Step 4: TTS (enabled by default, use --no-tts to skip)
+    _default_model_path = os.path.join(PROJECT_ROOT, "models", "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16")
+    _qwen3_model_path = args.tts_model if args.tts_model else _default_model_path
     if not args.no_tts:
         from tts import generate_batch
 
-        _qwen3_model_path = os.path.join(PROJECT_ROOT, "models", "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16")
-        if not os.path.exists(_qwen3_model_path):
+        _is_local = os.path.exists(_qwen3_model_path) or _qwen3_model_path.startswith(("/", "."))
+        if _is_local and not os.path.exists(_qwen3_model_path):
             print(f"[error] Qwen3 model not found at {_qwen3_model_path!r}. "
                   f"Download it to the models/ directory.", file=sys.stderr)
             sys.exit(1)
 
+        from voices import resolve_voice_instruct, get_voice_instruct
+        _genre_arg = args.genre
+        if _genre_arg == "auto":
+            if story_context and args.deepseek_key:
+                print(f"[voice] auto-detecting genres from story context...")
+                _instruct, _genres = resolve_voice_instruct(story_context, args.deepseek_key)
+                print(f"[voice] detected genres: {_genres}")
+                if len(_genres) > 1:
+                    print(f"[voice] blending {len(_genres)} genre presets → custom instruct")
+            else:
+                _genres = ["documentary"]
+                _instruct = get_voice_instruct("documentary")
+        else:
+            _genres = [_genre_arg]
+            _instruct = get_voice_instruct(_genre_arg)
+            print(f"[voice] using genre preset: {_genre_arg}")
+        storyboard.setdefault("metadata", {})["voice_genres"] = _genres
+        storyboard["metadata"]["voice_instruct"] = _instruct
+
         tts_kwargs: dict = {
             "model_path": _qwen3_model_path,
             "speed": args.qwen3_speed,
+            "instruct": _instruct,
         }
         if args.deepseek_key:
             tts_kwargs["api_key"] = args.deepseek_key
@@ -805,20 +845,78 @@ def main():
             json.dump(storyboard, f, indent=2)
         print(f"[tts] storyboard with ttsText → {tts_storyboard_path}")
 
+    # Step 4d: Build channel greeting beat (prepended before intro)
+    if not args.no_greeting:
+        from greeting import build_greeting_beat, DEFAULT_GREETING
+
+        greeting_mp3 = os.path.join(voiceover_dir, "scene_00.mp3")
+        if os.path.exists(greeting_mp3):
+            print(f"[greeting] scene_00.mp3 exists — skipping TTS")
+            import subprocess as _sp
+            try:
+                _r = _sp.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", greeting_mp3],
+                    capture_output=True, text=True, timeout=15,
+                )
+                _audio_secs = float(_r.stdout.strip())
+                _padding_frames = 15
+                _display_frames = max(int((_audio_secs + _padding_frames / args.fps) * args.fps), args.fps * 3)
+                from greeting import CHANNEL_NAME
+                greeting_beat = {
+                    "isGreeting": True, "window": 0,
+                    "startSec": 0.0, "endSec": round(_display_frames / args.fps, 3),
+                    "durationInFrames": _display_frames, "displayFrames": _display_frames,
+                    "povText": f"[GREETING] {args.greeting_text or DEFAULT_GREETING}",
+                    "narratedText": args.greeting_text or DEFAULT_GREETING,
+                    "dialogue": "", "startFmt": "00:00:00",
+                    "segments": [], "channelName": CHANNEL_NAME,
+                }
+            except Exception as _e:
+                print(f"[greeting] ffprobe failed ({_e}), re-generating")
+                greeting_beat = None
+        else:
+            greeting_beat = None
+
+        if greeting_beat is None:
+            step_start = time.time()
+            greeting_beat = build_greeting_beat(
+                fps=args.fps,
+                voiceover_dir=voiceover_dir,
+                model_path=_qwen3_model_path,
+                greeting_text=args.greeting_text or DEFAULT_GREETING,
+                tts_speed=args.qwen3_speed,
+            )
+            print(f"[greeting] done at {_ts()} — elapsed {_elapsed(step_start)}")
+
+        storyboard["scenes"].insert(0, greeting_beat)
+        with open(storyboard_path, "w") as f:
+            json.dump(storyboard, f, indent=2)
+        print(f"[greeting] beat prepended → window=0, {greeting_beat['displayFrames']} frames")
+
     # Step 5: Place video + voiceovers in remotion/public/
     setup_remotion_public(video_path, voiceover_dir=voiceover_dir)
+
+    # Also copy latest storyboard for Remotion Studio preview (auto-load in Root.tsx)
+    studio_sb_path = os.path.join(REMOTION_DIR, "src", "latest_storyboard.json")
+    with open(studio_sb_path, "w") as f:
+        json.dump(storyboard, f, indent=2)
+    print(f"[setup] storyboard → remotion/src/latest_storyboard.json")
 
     # Step 5b: Prepare beats for Remotion render (add window field for Zod validation)
     if os.path.exists(clustered_storyboard_path):
         with open(storyboard_path) as f:
             render_storyboard = json.load(f)
         for i, beat in enumerate(render_storyboard["scenes"]):
-            vo_path = f"voiceover/scene_{i+1:02d}.mp3"
+            # Greeting beat has window=0; regular beats have window already set in Step 4.
+            # Use existing window if present, fall back to i+1 for non-greeting beats.
+            w = beat.get("window", 0 if beat.get("isGreeting") else i)
+            vo_path = f"voiceover/scene_{w:02d}.mp3"
             real_path = os.path.join(run_dir, vo_path)
             if os.path.exists(real_path):
                 beat["voiceoverPath"] = vo_path
             # Ensure required fields for Zod: window, endSec, durationInFrames, startFmt
-            beat["window"] = i + 1
+            beat["window"] = w
             beat["endSec"] = beat.get("endSec", beat.get("startSec", 0) + beat.get("displayFrames", 30) / args.fps)
             beat["durationInFrames"] = beat.get("durationInFrames", beat.get("displayFrames", 30))
             beat["startFmt"] = beat.get("startFmt", "")
@@ -833,6 +931,17 @@ def main():
     print(f"[render] start at {_ts()}...")
     run_render(render_storyboard, output_mp4, concurrency=args.concurrency, gl=args.gl)
     print(f"[render] done at {_ts()} — elapsed {_elapsed(step_start)}")
+
+    # Step 8: Generate Premiere Pro XML/EDL for editing
+    step_start = time.time()
+    print(f"[premiere] generating XML/EDL...")
+    xml_path = os.path.join(run_dir, f"{run_name}_premiere.xml")
+    edl_path = os.path.join(run_dir, f"{run_name}_premiere.edl")
+    generate_premiere_xml(render_storyboard, xml_path, video_path, project_name=run_name)
+    generate_premiere_edl(render_storyboard, edl_path, project_name=run_name)
+    print(f"[premiere] XML → {xml_path}")
+    print(f"[premiere] EDL → {edl_path}")
+    print(f"[premiere] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
     pipeline_elapsed = _elapsed(pipeline_start)
     print(f"\n{'='*60}")

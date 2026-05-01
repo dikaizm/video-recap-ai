@@ -79,13 +79,19 @@ def generate_qwen3_tts(
 
 
 def load_qwen3_model(model_path: str):
+    """Load a TTS model from a local path or HuggingFace repo ID."""
     try:
-        from mlx_audio.tts.utils import load_model
+        from mlx_audio.tts import load as tts_load
     except ImportError:
         raise ImportError("Install mlx_audio: pip install mlx_audio")
-    resolved = _resolve_qwen3_model_path(model_path)
-    print(f"[tts] loading Qwen3 model from {resolved}")
-    return load_model(resolved)
+    # For local paths, resolve HF snapshots layout; for HF repo IDs, pass directly.
+    is_local = os.path.exists(model_path) or model_path.startswith("/") or model_path.startswith(".")
+    if is_local:
+        resolved = _resolve_qwen3_model_path(model_path)
+    else:
+        resolved = model_path  # HuggingFace repo ID
+    print(f"[tts] loading model: {resolved}")
+    return tts_load(resolved)
 
 
 

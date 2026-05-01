@@ -258,6 +258,7 @@ def _run_pipeline(args, run_dir: str, video_path: str, auto_story: str | None) -
     ollama_model = getattr(args, "ollama_model", "gemma4:e2b")
     ollama_host = getattr(args, "ollama_host", "http://localhost:11434")
     decode_height = getattr(args, "decode_height", 640)
+    story_context: str = ""  # resolved in narrate step below
     deepseek_key = getattr(args, "deepseek_key", "")
     qwen3_speed = getattr(args, "qwen3_speed", 1.0)
 
@@ -415,9 +416,29 @@ def _run_pipeline(args, run_dir: str, video_path: str, auto_story: str | None) -
             print(f"[error] Qwen3 model not found at {_qwen3_model_path!r}", file=sys.stderr)
             sys.exit(1)
 
+        from voices import resolve_voice_instruct, get_voice_instruct
+        _genre_arg = getattr(args, "genre", "auto")
+        if _genre_arg == "auto":
+            if story_context and deepseek_key:
+                _instruct, _genres = resolve_voice_instruct(story_context, deepseek_key)
+                print(f"[voice] detected genres: {_genres}")
+                if len(_genres) > 1:
+                    print(f"[voice] blending {len(_genres)} genre presets → custom instruct")
+            else:
+                _genres = ["documentary"]
+                _instruct = get_voice_instruct("documentary")
+        else:
+            _genres = [_genre_arg]
+            _instruct = get_voice_instruct(_genre_arg)
+            print(f"[voice] using genre preset: {_genre_arg}")
+
+        storyboard.setdefault("metadata", {})["voice_genres"] = _genres
+        storyboard["metadata"]["voice_instruct"] = _instruct
+
         tts_kwargs = {
             "model_path": _qwen3_model_path,
             "speed": qwen3_speed,
+            "instruct": _instruct,
         }
         generate_batch(storyboard["scenes"], voiceover_dir, **tts_kwargs)
         print(f"[pipeline] TTS done ({time.time() - step_start:.0f}s)")
@@ -599,11 +620,19 @@ def run_agent_loop(
 
                 out_path = os.path.join(voiceover_dir, f"scene_{window:02d}.mp3")
                 from tts import generate_qwen3_tts
+                # Reuse the blended instruct saved during initial TTS pass
+                _retts_instruct = updated.get("metadata", {}).get(
+                    "voice_instruct", ""
+                ) or updated.get("metadata", {}).get("voice_genres", ["documentary"])[0]
+                if not isinstance(_retts_instruct, str) or len(_retts_instruct) < 20:
+                    from voices import get_voice_instruct
+                    _retts_instruct = get_voice_instruct("documentary")
                 generate_qwen3_tts(
                     text=text,
                     output_mp3_path=out_path,
                     model=qwen3_model,
                     speed=getattr(args, "qwen3_speed", 1.0),
+                    instruct=_retts_instruct,
                 )
                 print(f"    beat {window}: re-generated → {out_path}")
 

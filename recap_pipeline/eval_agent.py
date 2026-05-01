@@ -122,7 +122,7 @@ def evaluate_beats(
     output_path: str,
     api_key: str,
     analysis_path: str | None = None,
-    batch_size: int = 10,
+    batch_size: int = 5,
 ) -> dict:
     """Cross-evaluate every beat: narration vs recap visual vs source scenes.
 
@@ -149,6 +149,7 @@ def evaluate_beats(
     eval_start = time.time()
 
     all_results: list[dict] = []
+    parse_failures = 0
 
     for chunk_start in range(0, total, batch_size):
         chunk_end = min(chunk_start + batch_size, total)
@@ -187,7 +188,7 @@ def evaluate_beats(
             raw = _http_post(
                 api_key,
                 messages=messages,
-                max_tokens=max(512, len(chunk_beats) * 120),
+                max_tokens=max(1024, len(chunk_beats) * 400),
                 temperature=0.2,
                 timeout=120,
                 thinking_enabled=False,
@@ -199,15 +200,16 @@ def evaluate_beats(
                 raise ValueError(f"bad evaluations: {chunk_results}")
         except Exception as e:
             print(f"  [eval] parse failed for chunk {chunk_start + 1}–{chunk_end}: {e}")
-            # Fill with default "ok" results on failure
+            parse_failures += 1
+            # Fill with unknown results — score 0 so they don't inflate ok_ratio
             chunk_results = []
             for i in range(len(chunk_beats)):
                 chunk_results.append({
                     "beat_index": chunk_start + i,
-                    "score": 3,
+                    "score": 0,
                     "visual_match": "unknown",
                     "issues": [f"evaluation parse error: {e}"],
-                    "fix_type": "ok",
+                    "fix_type": "eval_failed",
                     "fix_suggestion": "could not evaluate",
                 })
 
@@ -222,7 +224,7 @@ def evaluate_beats(
     # Compute aggregate stats
     scores = [r.get("score", 0) for r in all_results]
     avg_score = sum(scores) / max(1, len(scores))
-    ok_count = sum(1 for r in all_results if r.get("fix_type") == "ok")
+    ok_count = sum(1 for r in all_results if r.get("fix_type") == "ok" and r.get("score", 0) > 0)
     fix_counts = {
         "rewrite_narration": sum(1 for r in all_results if r.get("fix_type") == "rewrite_narration"),
         "swap_scene": sum(1 for r in all_results if r.get("fix_type") == "swap_scene"),
@@ -230,13 +232,18 @@ def evaluate_beats(
         "both": sum(1 for r in all_results if r.get("fix_type") == "both"),
     }
 
+    total_chunks = max(1, -(-total // batch_size))  # ceil div
+    # If >50% of chunks failed to parse, evaluation is unreliable — don't pass
+    eval_reliable = parse_failures <= total_chunks // 2
     eval_output = {
         "total_beats": total,
+        "parse_failures": parse_failures,
+        "eval_reliable": eval_reliable,
         "average_score": round(avg_score, 2),
         "ok_count": ok_count,
         "ok_ratio": round(ok_count / max(1, total), 2),
         "fix_counts": fix_counts,
-        "passed": ok_count / max(1, total) >= 0.85,
+        "passed": eval_reliable and ok_count / max(1, total) >= 0.85,
         "evaluations": all_results,
     }
 
@@ -244,9 +251,11 @@ def evaluate_beats(
         json.dump(eval_output, f, indent=2)
 
     elapsed = time.time() - eval_start
+    reliability_note = "" if eval_reliable else f" ⚠ {parse_failures}/{total_chunks} chunks failed — eval unreliable"
     print(
         f"[eval] done — avg_score={avg_score:.2f}, ok={ok_count}/{total} "
-        f"({ok_count / max(1, total):.0%}), elapsed={elapsed:.1f}s"
+        f"({ok_count / max(1, total):.0%}), parse_failures={parse_failures}/{total_chunks}"
+        f"{reliability_note}, elapsed={elapsed:.1f}s"
     )
     return eval_output
 
@@ -260,7 +269,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True, help="Path for eval_results.json")
     parser.add_argument("--deepseek-key", default=os.environ.get("DEEPSEEK_API_KEY"))
     parser.add_argument("--analysis", default=None, help="Original analysis.json for source scene lookup")
-    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=5)
     args = parser.parse_args()
 
     evaluate_beats(
