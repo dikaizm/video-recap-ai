@@ -246,12 +246,17 @@ def align_beats(
     fps: int,
     expand: int = 2,
     whisper_model_size: str = "tiny.en",
+    on_progress: "callable[[int, dict], None] | None" = None,
 ) -> list[dict]:
     """Mutate `beats` in place, attaching a `segments` list to each beat that has TTS audio.
 
     Each segment = {startSec, displayFrames} pointing into the source video.
     The render plays segments in sequence inside the beat while a single audio
     track covers the whole beat.
+
+    Beats that already have ``aligned: true`` are skipped so a crashed run can
+    resume where it left off. ``on_progress(i, beat)`` is called after each beat
+    is processed (aligned or skipped) so the caller can persist intermediate state.
     """
     if not beats:
         return beats
@@ -263,22 +268,34 @@ def align_beats(
     source_order = [s["window"] for s in source_scenes if "window" in s]
 
     aligned = 0
+    resumed = 0
     skipped = 0
     fallback_count = 0
     started = time.time()
 
     for i, beat in enumerate(beats):
+        # Skip beats that were already aligned in a previous (crashed) run.
+        if beat.get("aligned"):
+            resumed += 1
+            if on_progress:
+                on_progress(i, beat)
+            continue
+
         text = (beat.get("ttsText") or beat.get("narratedText") or "").strip()
         window = beat.get("window") or (i + 1)
         mp3 = os.path.join(voiceover_dir, f"scene_{window:02d}.mp3")
         if not text or not os.path.exists(mp3):
             skipped += 1
+            if on_progress:
+                on_progress(i, beat)
             continue
 
         # Intro keeps the 3 establishing visuals it was built with — phrase-aligning
         # would condense the segment count and drop visuals.
         if beat.get("isIntro"):
             skipped += 1
+            if on_progress:
+                on_progress(i, beat)
             continue
 
         try:
@@ -286,17 +303,23 @@ def align_beats(
         except Exception as e:  # noqa: BLE001
             print(f"  [align] beat {window:02d} STT failed ({e}); skipping")
             skipped += 1
+            if on_progress:
+                on_progress(i, beat)
             continue
 
         beat_total_frames = int(beat.get("displayFrames") or 0)
         if beat_total_frames <= 0:
             skipped += 1
+            if on_progress:
+                on_progress(i, beat)
             continue
         audio_secs = beat_total_frames / fps
 
         phrases = split_phrases(text)
         if not phrases:
             skipped += 1
+            if on_progress:
+                on_progress(i, beat)
             continue
 
         phrase_times = map_phrases_to_times(phrases, stt_words, audio_secs)
@@ -304,6 +327,8 @@ def align_beats(
         candidates = _candidate_pool(beat, source_index, source_order, expand)
         if not candidates:
             skipped += 1
+            if on_progress:
+                on_progress(i, beat)
             continue
 
         # Single phrase + single candidate: nothing to disambiguate, leave as one segment.
@@ -337,12 +362,18 @@ def align_beats(
                 segments[-1]["displayFrames"] = max(1, segments[-1]["displayFrames"] + diff)
 
         beat["segments"] = segments
+        beat["aligned"] = True  # checkpoint marker — skip on resume
         aligned += 1
+
+        if on_progress:
+            on_progress(i, beat)
 
         if (i + 1) % 20 == 0 or (i + 1) == len(beats):
             elapsed = time.time() - started
             print(f"  [align] {i + 1}/{len(beats)} beats ({elapsed:.1f}s)")
 
+    if resumed:
+        print(f"[align] resumed {resumed} already-aligned beats")
     print(
         f"[align] aligned {aligned} beats, skipped {skipped}, "
         f"single-phrase fallbacks {fallback_count} — elapsed {time.time() - started:.1f}s"

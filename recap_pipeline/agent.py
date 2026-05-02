@@ -15,6 +15,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from narrate import _http_post, _parse_batch_response  # type: ignore
+from state import PipelineState, atomic_write_json
 
 
 FIX_NARRATION_SYSTEM = """\
@@ -34,7 +35,7 @@ Write a NEW narration line that:
 - Is 12-30 words, matching the beat's 4-8s video duration
 - Never repeats visual descriptions word-for-word — tell the story
 
-Return ONLY a JSON object: {"narration": "new narration text"}\
+Return ONLY a JSON object: {{"narration": "new narration text"}}\
 """
 
 
@@ -272,19 +273,32 @@ def _run_pipeline(args, run_dir: str, video_path: str, auto_story: str | None) -
     setup_run_logging(run_dir)
 
     # Step 1: Analysis (via analyze.py subprocess — it has complex frame extraction)
-    step_start = time.time()
-    print(f"[pipeline] step 1: analysis...")
-    cmd = [
-        sys.executable, os.path.join(PACKAGE_DIR, "analyze.py"),
-        "--video", video_path,
-        "--output", analysis_json,
-        "--ollama-model", ollama_model,
-        "--ollama-host", ollama_host,
-    ]
-    if decode_height > 0:
-        cmd += ["--decode-height", str(decode_height)]
-    _stream_subprocess(cmd, cwd=PROJECT_ROOT)
-    print(f"[pipeline] analysis done ({time.time() - step_start:.0f}s)")
+    skip_analysis = getattr(args, "skip_analysis", False)
+    external_analysis = getattr(args, "analysis_json", None)
+
+    if external_analysis and os.path.exists(external_analysis):
+        import shutil
+        shutil.copy2(external_analysis, analysis_json)
+        print(f"[pipeline] step 1: analysis (reused from {external_analysis})")
+    elif skip_analysis and os.path.exists(analysis_json):
+        print(f"[pipeline] step 1: analysis (reused existing {analysis_json})")
+    elif skip_analysis or external_analysis:
+        print(f"[error] --skip-analysis / --analysis-json set but no analysis file found", file=sys.stderr)
+        sys.exit(1)
+    else:
+        step_start = time.time()
+        print(f"[pipeline] step 1: analysis...")
+        cmd = [
+            sys.executable, os.path.join(PACKAGE_DIR, "analyze.py"),
+            "--video", video_path,
+            "--output", analysis_json,
+            "--ollama-model", ollama_model,
+            "--ollama-host", ollama_host,
+        ]
+        if decode_height > 0:
+            cmd += ["--decode-height", str(decode_height)]
+        _stream_subprocess(cmd, cwd=PROJECT_ROOT)
+        print(f"[pipeline] analysis done ({time.time() - step_start:.0f}s)")
 
     # Step 2: Transform
     step_start = time.time()
@@ -486,6 +500,28 @@ def _run_pipeline(args, run_dir: str, video_path: str, auto_story: str | None) -
     run_render(storyboard, output_mp4, concurrency=getattr(args, "concurrency", None), gl=getattr(args, "gl", "angle"))
     print(f"[pipeline] render done ({time.time() - step_start:.0f}s)")
 
+    # Step 9: YouTube metadata (title, description, hashtags)
+    from pathlib import Path as _Path
+    run_name = _Path(video_path).stem
+    meta_path = os.path.join(run_dir, f"{run_name}_metadata.md")
+    if deepseek_key:
+        from metadata_gen import generate_video_metadata
+        step_start = time.time()
+        print(f"[pipeline] step 9: metadata...")
+        try:
+            generate_video_metadata(
+                storyboard=storyboard,
+                movie_title=run_name.replace("-", " ").replace("_", " "),
+                api_key=deepseek_key,
+                story_context=story_context or "",
+                output_path=meta_path,
+            )
+            print(f"[pipeline] metadata done ({time.time() - step_start:.0f}s) → {meta_path}")
+        except Exception as e:
+            print(f"[metadata] failed: {e}", file=sys.stderr)
+    else:
+        print("[metadata] skipped — no DeepSeek key")
+
 
 def run_agent_loop(
     args,
@@ -531,6 +567,22 @@ def run_agent_loop(
     review_json = os.path.join(run_dir, "review_analysis.json")
     eval_json = os.path.join(run_dir, "eval_results.json")
 
+    ps = PipelineState(run_dir)
+
+    def _save_agent_checkpoint(iteration: int, storyboard: dict, eval_data: dict | None = None) -> None:
+        """Persist per-iteration state so a crash can resume from this point."""
+        ckpt = {
+            "iteration": iteration,
+            "storyboard": storyboard,
+            "eval": eval_data or {},
+        }
+        ckpt_path = os.path.join(run_dir, f"agent_iter_{iteration:02d}.json")
+        atomic_write_json(ckpt_path, ckpt)
+        ps._state.setdefault("agent", {})["last_iteration"] = iteration
+        ps._state["agent"]["checkpoint"] = ckpt_path
+        ps._save()
+        print(f"[agent] checkpoint saved → {ckpt_path}")
+
     # --- Iteration 0: produce initial recap ---
     print(f"\n{'=' * 60}")
     print(f"[agent] ITERATION 0: producing initial recap")
@@ -538,6 +590,10 @@ def run_agent_loop(
 
     # Run pipeline steps directly (avoids subprocess directory mismatch)
     _run_pipeline(args, run_dir, video_path, auto_story)
+    if os.path.exists(storyboard_path):
+        with open(storyboard_path) as _f:
+            _sb0 = json.load(_f)
+        _save_agent_checkpoint(0, _sb0)
 
     # --- Iteration loop ---
     for iteration in range(1, max_iter + 1):
@@ -638,8 +694,9 @@ def run_agent_loop(
 
             # Re-sync display frames to new audio
             adjust_display_frames_to_audio(updated, voiceover_dir, getattr(args, "fps", 30))
-            with open(storyboard_path, "w") as f:
-                json.dump(updated, f, indent=2)
+            atomic_write_json(storyboard_path, updated)
+
+        _save_agent_checkpoint(iteration, updated, eval_data)
 
         # Re-render
         if not agent_no_render:

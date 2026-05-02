@@ -112,13 +112,18 @@ export const SceneComponent: React.FC<Props> = ({
   isGreeting,
   channelName,
 }) => {
-  // Greeting beat: branded title card, no source video
   if (isGreeting) {
+    const segs: SceneSegment[] =
+      segments && segments.length > 0
+        ? segments
+        : [{ startSec, displayFrames }];
     return (
       <GreetingCard
         channelName={channelName ?? "Premiere Roll"}
         voiceoverPath={voiceoverPath}
         displayFrames={displayFrames}
+        videoSrc={videoSrc}
+        videoStartSec={segs[0].startSec}
       />
     );
   }

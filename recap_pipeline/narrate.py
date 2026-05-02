@@ -397,6 +397,10 @@ def narrate_beats(
     #  - intro beats (always — they have purpose-built narration from intro.py)
     #  - beats with existing narratedText, unless force=True
     batch_size = NARRATE_BATCH_SIZE
+    # How many beats on each side of the current batch to include as context.
+    window_before = 4   # already-narrated beats: shown as visual + narration text
+    window_after  = 3   # upcoming beats: shown as visual only (hook targets)
+
     pending = [
         (i, b) for i, b in enumerate(beats)
         if not b.get("isIntro") and (force or not b.get("narratedText"))
@@ -405,7 +409,6 @@ def narrate_beats(
     if skipped_existing > 0:
         print(f"[narrate_beats] skipping {skipped_existing} beat(s) (intro or already narrated)")
 
-    narration_history: list[str] = []
     batch_num = 0
     saved_count = 0
 
@@ -416,38 +419,79 @@ def narrate_beats(
         batch_num += 1
         batch_beats = [beats[idx] for idx, _ in chunk]
 
-        chunk_windows = f"{chunk[0][0]:02d}–{chunk[-1][0]:02d}"
+        first_idx = chunk[0][0]
+        last_idx  = chunk[-1][0]
+        chunk_windows = f"{first_idx:02d}–{last_idx:02d}"
         print(f"\n  batch {batch_num}: beats {chunk_windows} ({len(batch_beats)} beats)...")
 
-        # Build beat descriptions for the prompt
+        # --- Sliding window: BEFORE context ---
+        # Show the window_before beats that immediately precede this chunk.
+        # For each beat include its visual description and its narration (if already done).
+        before_start = max(0, first_idx - window_before)
+        before_ctx_beats = [
+            b for b in beats[before_start:first_idx]
+            if not b.get("isIntro")
+        ]
+        before_block = ""
+        if before_ctx_beats:
+            lines = []
+            for b in before_ctx_beats:
+                pov = b.get("povText", "").strip()[:220]
+                nar = b.get("narratedText", "").strip()
+                if nar:
+                    lines.append(f"  visual: {pov} → spoken: \"{nar}\"")
+                else:
+                    lines.append(f"  visual: {pov} → [skipped]")
+            before_block = (
+                "ALREADY NARRATED (the beats just before — maintain continuity, "
+                "don't repeat these lines):\n"
+                + "\n".join(lines)
+                + "\n\n"
+            )
+
+        # --- Sliding window: AFTER context ---
+        # Show the window_after beats that immediately follow this chunk.
+        # Only visual — the LLM hasn't narrated them yet. Use as hook targets.
+        after_end = min(len(beats), last_idx + 1 + window_after)
+        after_ctx_beats = [
+            b for b in beats[last_idx + 1:after_end]
+            if not b.get("isIntro")
+        ]
+        after_block = ""
+        if after_ctx_beats:
+            lines = []
+            for b in after_ctx_beats:
+                pov = b.get("povText", "").strip()[:220]
+                lines.append(f"  visual: {pov}")
+            after_block = (
+                "\nUPCOMING beats (not yours to narrate — use them to write forward-pointing "
+                "hooks at the end of your last beat above):\n"
+                + "\n".join(lines)
+            )
+
+        # --- Current batch beats ---
         scene_lines: list[str] = []
         for beat_idx, beat in enumerate(batch_beats):
-            # Assign a synthetic window for identification
-            beat_id = chunk_start + beat_idx
+            beat_id = first_idx + beat_idx
             pct = int(round(beat.get("startSec", 0) / total_duration * 100)) if total_duration else 0
             pov = beat.get("povText", "").strip()
             dialogue = beat.get("dialogue", "").strip()
-            # Use middle importance score
-            score = 3  # Default for beats
+            score = 3
             min_w, max_w = BEAT_WORD_TARGETS[score]
 
             line = f"[Beat {beat_id}] score={score}/5 target={min_w}–{max_w}w pos={pct}%"
             if pov:
-                # Include full description, not just truncated
                 line += f" visual: {pov[:500]}"
             if dialogue:
                 line += f" dialogue: {dialogue[:300]}"
             scene_lines.append(line)
 
-        # History
-        history_block = ""
-        if narration_history:
-            recent = narration_history[-6:]
-            history_block = "Previous beats already narrated:\n"
-            history_block += "\n".join(f"- {nar}" for nar in recent)
-            history_block += "\n\n"
-
-        user_prompt = history_block + "Beats to narrate:\n" + "\n".join(scene_lines)
+        user_prompt = (
+            before_block
+            + "Beats to narrate:\n"
+            + "\n".join(scene_lines)
+            + after_block
+        )
         batch_max_tokens = max(512, len(batch_beats) * 100 + 400)
 
         result = _http_post(
@@ -471,11 +515,10 @@ def narrate_beats(
                 beats[orig_idx]["narratedText"] = narration
                 wc = len(narration.split())
                 print(f"    beat {orig_idx+1:02d} words={wc} → {narration[:80]}...")
-                narration_history.append(narration)
             else:
                 beats[orig_idx]["narratedText"] = ""
 
-        # Save progress
+        # Save progress after each batch
         saved_count = chunk_start + len(chunk)
         storyboard["scenes"] = beats
         with open(output_path, "w") as f:

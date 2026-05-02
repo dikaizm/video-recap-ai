@@ -8,6 +8,7 @@ Generates per-scene MP3 files from a single continuous TTS stream:
      using word-count-proportional timestamps.
 """
 import os
+import re as _re
 import shutil
 import subprocess
 import tempfile
@@ -68,11 +69,17 @@ def generate_qwen3_tts(
         if not os.path.exists(wav_path):
             raise RuntimeError(f"Qwen3 TTS produced no output in {tmp_dir}")
 
-        subprocess.run(
+        result = subprocess.run(
             ["ffmpeg", "-y", "-i", wav_path,
-             "-ar", str(sample_rate), "-q:a", "4", output_mp3_path],
-            check=True, capture_output=True,
+             "-ar", str(sample_rate), "-f", "mp3", "-c:a", "libmp3lame", "-q:a", "4", output_mp3_path],
+            capture_output=True, text=True,
         )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed (exit {result.returncode})\n"
+                f"stderr: {result.stderr[-2000:]}\n"
+                f"stdout: {result.stdout[-500:] if result.stdout else '(none)'}"
+            )
     finally:
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -357,6 +364,23 @@ def _concat_mp3s(input_paths: list[str], output_path: str) -> None:
             os.unlink(list_file)
 
 
+def _probe_audio(path: str) -> float | None:
+    """Return audio duration in seconds, or None if file is missing/corrupt."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not os.path.exists(path):
+        return None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        val = result.stdout.strip()
+        return float(val) if val else None
+    except Exception:
+        return None
+
+
 def generate_batch(
     scenes: list[dict],
     voiceover_dir: str,
@@ -387,6 +411,18 @@ def generate_batch(
     total = len(scenes_with_text)
     print(f"[tts] {total} scenes, {total_words} words — per-scene generation")
 
+    # Remove stale MP3s whose window index is higher than the current max window.
+    # This cleans up leftovers from a prior run that had more beats.
+    expected_windows = {s.get("window", i + 1) for i, s in enumerate(scenes_with_text)}
+    max_window = max(expected_windows) if expected_windows else 0
+    for fname in os.listdir(voiceover_dir):
+        m = _re.match(r"scene_(\d+)\.mp3$", fname)
+        if m:
+            w = int(m.group(1))
+            if w > max_window:
+                os.unlink(os.path.join(voiceover_dir, fname))
+                print(f"  [tts] removed stale {fname} (window {w} > max {max_window})")
+
     window_to_path: dict[int, str] = {}
     for i, scene in enumerate(scenes_with_text):
         # Support both scenes (window key) and beats (no window key, use index)
@@ -396,12 +432,23 @@ def generate_batch(
         out_path = os.path.join(voiceover_dir, f"scene_{w:02d}.mp3")
 
         if os.path.exists(out_path):
-            print(f"  skip scene {w:02d}/{total} (exists)")
-            window_to_path[w] = out_path
-            continue
+            dur = _probe_audio(out_path)
+            if dur is not None and dur > 0.3:
+                print(f"  skip scene {w:02d}/{total} (exists, {dur:.1f}s)")
+                window_to_path[w] = out_path
+                continue
+            else:
+                print(f"  scene {w:02d}: existing MP3 invalid (dur={dur}), re-generating")
 
         print(f"  scene {w:02d}/{total} ({wc} words)...")
-        generate_qwen3_tts(text, out_path, model=qwen3_model, **kwargs)
+        tmp_path = out_path + ".tmp"
+        generate_qwen3_tts(text, tmp_path, model=qwen3_model, **kwargs)
+        # Validate before committing
+        dur = _probe_audio(tmp_path)
+        if dur is None or dur <= 0.3:
+            os.unlink(tmp_path)
+            raise RuntimeError(f"[tts] scene {w:02d}: TTS produced invalid audio (dur={dur})")
+        os.replace(tmp_path, out_path)
         window_to_path[w] = out_path
 
         # Save progress incrementally — stamp ttsText

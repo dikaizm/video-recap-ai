@@ -34,6 +34,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from state import PipelineState, atomic_write_json, probe_audio
+
 # Project root is one level up from this file (recap_pipeline/)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -360,6 +362,27 @@ def run_render(storyboard: dict, output_mp4: str, concurrency: int | None = None
     print(f"[render] done → {abs_output}")
 
 
+PIPELINE_STEPS = [
+    "analysis", "transform", "cluster", "intro",
+    "narrate", "tts", "align", "greeting",
+    "render", "premiere", "metadata",
+]
+
+DOWNSTREAM: dict[str, list[str]] = {
+    "analysis":  ["transform", "cluster", "intro", "narrate", "tts", "align", "greeting", "render", "premiere", "metadata"],
+    "transform": ["cluster", "intro", "narrate", "tts", "align", "greeting", "render", "premiere", "metadata"],
+    "cluster":   ["intro", "narrate", "tts", "align", "greeting", "render", "premiere", "metadata"],
+    "intro":     ["narrate", "tts", "align", "greeting", "render", "premiere", "metadata"],
+    "narrate":   ["tts", "align", "greeting", "render", "premiere", "metadata"],
+    "tts":       ["align", "greeting", "render", "premiere", "metadata"],
+    "align":     ["greeting", "render", "premiere", "metadata"],
+    "greeting":  ["render", "premiere", "metadata"],
+    "render":    ["premiere", "metadata"],
+    "premiere":  ["metadata"],
+    "metadata":  [],
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Movie recap pipeline")
     input_group = parser.add_mutually_exclusive_group(required=True)
@@ -412,7 +435,17 @@ def main():
                         help="Neighbor expansion when picking candidate scenes per phrase (default: 2)")
     parser.add_argument("--narrate", action="store_true", help="Synthesize narration via DeepSeek before TTS")
     parser.add_argument("--deepseek-key", default=os.environ.get("DEEPSEEK_API_KEY"), help="DeepSeek API key (env: DEEPSEEK_API_KEY)")
-    parser.add_argument("--narrate-force", action="store_true", help="Re-generate narration even if it exists")
+    parser.add_argument("--narrate-force", action="store_true", help="Re-generate narration even if it exists (alias for --force-narrate)")
+    for _step in PIPELINE_STEPS:
+        parser.add_argument(
+            f"--force-{_step}",
+            action="store_true",
+            help=f"Force re-run of {_step} step and all downstream steps",
+        )
+    parser.add_argument(
+        "--force-from", metavar="STEP", choices=PIPELINE_STEPS,
+        help="Re-run from this step and all downstream steps",
+    )
     parser.add_argument("--story-context", default=None, help="Story synopsis text or path to a .txt/.md file to guide narration")
     parser.add_argument(
         "--vlm-min-coverage", type=float, default=VLM_MIN_DESCRIPTION_RATIO,
@@ -425,14 +458,14 @@ def main():
                         help="Remotion WebGL backend: angle (default, Metal on macOS), swiftshader, egl")
     parser.add_argument("--output", default=None, help="Output MP4 path (default: output/<video>_<timestamp>/recap.mp4)")
     parser.add_argument("--render-height", type=int, default=None, help="Downscale output to this height in pixels (e.g. 480). Width is scaled proportionally.")
-    parser.add_argument("--agent", action="store_true", help="Enable agent self-review loop after initial render")
+    parser.add_argument("--no-agent", action="store_true", help="Disable agent self-review loop (runs by default)")
     parser.add_argument("--agent-max-iter", type=int, default=3, help="Maximum self-improvement iterations (default: 3)")
     parser.add_argument("--agent-threshold", type=float, default=0.85, help="Stop when this fraction of beats score 4+ (default: 0.85)")
     parser.add_argument("--agent-no-render", action="store_true", help="Skip re-render during agent loop (eval only)")
     args = parser.parse_args()
 
-    # Agent loop: delegate to agent.py and exit early
-    if args.agent:
+    # Agent loop: delegate to agent.py and exit early (default behaviour; skip with --no-agent)
+    if not args.no_agent:
         # Agent always enables narration and TTS
         args.narrate = True
         args.no_tts = False
@@ -497,84 +530,44 @@ def main():
     print(f"[run] output directory: {run_dir}")
 
     output_mp4 = args.output or os.path.join(run_dir, "recap.mp4")
-    voiceover_dir = os.path.join(run_dir, "voiceover") if not args.no_tts else None
+    voiceover_dir = os.path.join(run_dir, "voiceover")
     storyboard_path = os.path.join(run_dir, "storyboard.json")
     narrated_storyboard_path = os.path.join(run_dir, "storyboard_narrated.json")
     evaluated_storyboard_path = os.path.join(run_dir, "storyboard_evaluated.json")
     tts_storyboard_path = os.path.join(run_dir, "storyboard_tts.json")
     analysis_json = os.path.join(run_dir, "analysis.json")
 
-    # Detect completed steps for --resume
-    def _detect_completed_steps():
-        completed = set()
-        if os.path.exists(analysis_json):
-            try:
-                with open(analysis_json) as f:
-                    data = json.load(f)
-                    if data.get("scenes"):
-                        completed.add("analysis")
-            except:
-                pass
-        if os.path.exists(storyboard_path):
-            completed.add("transform")
-        if os.path.exists(narrated_storyboard_path):
-            try:
-                with open(narrated_storyboard_path) as f:
-                    data = json.load(f)
-                scenes = data.get("scenes", [])
-                if scenes:
-                    narrated_count = sum(1 for s in scenes if s.get("narratedText"))
-                    # Consider complete if 95%+ scenes have narration
-                    if narrated_count >= len(scenes) * 0.95:
-                        completed.add("narrate")
-            except:
-                pass
-        if os.path.exists(evaluated_storyboard_path):
-            completed.add("evaluate")
-        if os.path.exists(voiceover_dir):
-            try:
-                mp3_count = len([f for f in os.listdir(voiceover_dir) if f.endswith(".mp3")])
-                # Also check narrated storyboard for scene count
-                if os.path.exists(narrated_storyboard_path):
-                    with open(narrated_storyboard_path) as f:
-                        data = json.load(f)
-                    scenes = data.get("scenes", [])
-                    # Consider complete if 95%+ of narrated scenes have voiceovers
-                    narrated_scenes = [s for s in scenes if s.get("narratedText")]
-                    if narrated_scenes and mp3_count >= len(narrated_scenes) * 0.95:
-                        completed.add("tts")
-            except:
-                pass
-        if os.path.exists(output_mp4):
-            completed.add("render")
-        return completed
+    # --- Pipeline state manifest ---
+    ps = PipelineState(run_dir)
+
+    # Resolve force flags: --force-<step> and --force-from clear state for that step + downstream.
+    _forced: set[str] = set()
+    for _step in PIPELINE_STEPS:
+        flag = f"force_{_step.replace('-', '_')}"
+        if getattr(args, flag, False):
+            _forced.update([_step] + DOWNSTREAM.get(_step, []))
+    # --narrate-force is a legacy alias for --force-narrate
+    if args.narrate_force:
+        _forced.update(["narrate"] + DOWNSTREAM.get("narrate", []))
+    if getattr(args, "force_from", None):
+        _forced.update([args.force_from] + DOWNSTREAM.get(args.force_from, []))
+    if _forced:
+        print(f"[state] forcing re-run of: {', '.join(s for s in PIPELINE_STEPS if s in _forced)}")
+        ps.clear_steps(list(_forced))
 
     if args.resume:
-        completed_steps = _detect_completed_steps()
-        print(f"[resume] detected completed steps: {', '.join(sorted(completed_steps)) or 'none'}")
-        if "analysis" in completed_steps and not args.analysis_json:
-            args.skip_analysis = True
-            print(f"[resume] skipping analysis (already complete)")
-        if "narrate" in completed_steps and not args.narrate_force:
-            args.narrate = False
-            print(f"[resume] skipping narration (already complete, use --narrate-force to regenerate)")
-        if "tts" in completed_steps:
-            args.no_tts = True
-            print(f"[resume] skipping TTS (already complete)")
-        if "render" in completed_steps:
-            print(f"[resume] render already complete: {output_mp4}")
-            return
+        print(f"[resume] pipeline state: {ps.summary()}")
 
     # Step 1: Analysis
     step_start = time.time()
     if args.analysis_json:
         analysis_json = args.analysis_json
-        print(f"[analyze] using existing JSON: {analysis_json}")
-    elif args.skip_analysis:
-        # For --resume, use the analysis.json in run_dir first
-        if os.path.exists(analysis_json):
-            print(f"[analyze] using existing JSON: {analysis_json}")
-        else:
+        print(f"[analyze] using external JSON: {analysis_json}")
+        ps.mark_complete("analysis", note="external")
+    elif args.skip_analysis or (args.resume and ps.is_complete("analysis")):
+        if args.resume and ps.is_complete("analysis"):
+            print("[analyze] resuming — already complete")
+        if not os.path.exists(analysis_json):
             candidates = [
                 os.path.join(OUTPUT_BASE, "analysis.json"),
                 os.path.join(OUTPUT_BASE, "shared", "analysis.json"),
@@ -583,13 +576,15 @@ def main():
             if not analysis_json:
                 print("[error] --skip-analysis set but no analysis.json found", file=sys.stderr)
                 sys.exit(1)
-            print(f"[analyze] using existing JSON: {analysis_json}")
+        print(f"[analyze] using existing JSON: {analysis_json}")
     else:
+        ps.mark_running("analysis")
         extra_args = ["--ollama-model", args.ollama_model, "--ollama-host", args.ollama_host]
         if args.decode_height:
             extra_args += ["--decode-height", str(args.decode_height)]
         print(f"[analyze] start at {_ts()} (VLM={args.ollama_model})...")
         run_analysis(video_path, analysis_json, extra_args=extra_args)
+        ps.mark_complete("analysis")
         print(f"[analyze] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
     if args.vlm_min_coverage > 0:
@@ -597,46 +592,68 @@ def main():
 
     # Step 2: Transform (scene selection)
     step_start = time.time()
-    print(f"[transform] start at {_ts()}...")
     from transform import transform as do_transform
 
-    storyboard = do_transform(
-        analysis_path=analysis_json,
-        output_path=storyboard_path,
-        video_path=video_path,
-        fps=args.fps,
-        recap_ratio=args.recap_ratio,
-        voiceover_dir=voiceover_dir,
-    )
-    print(f"[transform] done at {_ts()} — elapsed {_elapsed(step_start)}")
+    if args.resume and ps.is_complete("transform") and os.path.exists(storyboard_path):
+        print("[transform] resuming — already complete")
+        with open(storyboard_path) as f:
+            storyboard = json.load(f)
+    else:
+        ps.mark_running("transform")
+        print(f"[transform] start at {_ts()}...")
+        storyboard = do_transform(
+            analysis_path=analysis_json,
+            output_path=storyboard_path,
+            video_path=video_path,
+            fps=args.fps,
+            recap_ratio=args.recap_ratio,
+            voiceover_dir=voiceover_dir,
+        )
+        ps.mark_complete("transform")
+        print(f"[transform] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
     # Step 2b: Cluster scenes into beats (for proper pacing)
     clustered_storyboard_path = os.path.join(run_dir, "storyboard_clustered.json")
     from cluster import cluster_scenes
 
-    step_start = time.time()
-    print(f"[cluster] start at {_ts()}...")
-    target_duration = sum(s["displayFrames"] for s in storyboard["scenes"]) / args.fps
-    # Keep the source-scene pool around so align.py can expand to neighbors and
-    # intro.py can pick establishing shots.
+    # source_scenes_pool comes from pre-cluster storyboard (individual scenes).
+    # Always populated from storyboard.json so align.py can expand to neighbors.
     source_scenes_pool = list(storyboard["scenes"])
-    clustered_scenes = cluster_scenes(
-        storyboard["scenes"],
-        target_duration=target_duration,
-        fps=args.fps,
-        min_beat_sec=args.min_beat_sec,
-        max_beat_sec=args.max_beat_sec,
-    )
-    clustered = {**storyboard, "scenes": clustered_scenes}
-    with open(clustered_storyboard_path, "w") as f:
-        json.dump(clustered, f, indent=2)
-    print(f"[cluster] done at {_ts()} — elapsed {_elapsed(step_start)}")
+
+    step_start = time.time()
+    if args.resume and ps.is_complete("cluster") and os.path.exists(clustered_storyboard_path):
+        print("[cluster] resuming — already complete")
+        with open(clustered_storyboard_path) as f:
+            clustered = json.load(f)
+        clustered_scenes = clustered["scenes"]
+    else:
+        ps.mark_running("cluster")
+        print(f"[cluster] start at {_ts()}...")
+        target_duration = sum(s["displayFrames"] for s in storyboard["scenes"]) / args.fps
+        clustered_scenes = cluster_scenes(
+            storyboard["scenes"],
+            target_duration=target_duration,
+            fps=args.fps,
+            min_beat_sec=args.min_beat_sec,
+            max_beat_sec=args.max_beat_sec,
+        )
+        clustered = {**storyboard, "scenes": clustered_scenes}
+        atomic_write_json(clustered_storyboard_path, clustered)
+        ps.mark_complete("cluster")
+        print(f"[cluster] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
     # Step 2c: Build + prepend the intro beat (skipped with --no-intro or when
     # narration is disabled, since the intro narration is generated via DeepSeek).
     if not args.no_intro and args.narrate:
         if not args.deepseek_key:
+            ps.mark_skipped("intro", "no deepseek key")
             print("[intro] skipping — DeepSeek key required (or pass --no-intro)")
+        elif args.resume and ps.is_complete("intro"):
+            print("[intro] resuming — already complete")
+            # Reload clustered so the intro beat is present in memory.
+            with open(clustered_storyboard_path) as f:
+                clustered = json.load(f)
+            clustered_scenes = clustered["scenes"]
         else:
             # Resolve story context for the intro narration.
             _intro_context: str | None = args.story_context
@@ -649,6 +666,7 @@ def main():
 
             from intro import build_intro_beat
 
+            ps.mark_running("intro")
             step_start = time.time()
             print(f"[intro] start at {_ts()}...")
             intro_beat = build_intro_beat(
@@ -661,15 +679,17 @@ def main():
             if intro_beat:
                 clustered_scenes = [intro_beat] + clustered_scenes
                 clustered["scenes"] = clustered_scenes
-                with open(clustered_storyboard_path, "w") as f:
-                    json.dump(clustered, f, indent=2)
+                atomic_write_json(clustered_storyboard_path, clustered)
                 print(
                     f"[intro] prepended intro beat ({len(intro_beat['scenes'])} scenes, "
                     f"{intro_beat['displayFrames']} frames) — \"{intro_beat['narratedText']}\""
                 )
             else:
                 print("[intro] skipped — no source scenes available")
+            ps.mark_complete("intro")
             print(f"[intro] done at {_ts()} — elapsed {_elapsed(step_start)}")
+    else:
+        ps.mark_skipped("intro", "--no-intro or narrate disabled")
 
     # Step 3: Narration (optional)
     narration_meta: dict[int, dict] = {}
@@ -683,49 +703,62 @@ def main():
         with open(auto_story_path) as f:
             story_context = f.read().strip()
 
+    _narrate_ran = False  # controls whether the validation block runs below
     if args.narrate:
         if not args.deepseek_key:
             print("[error] --deepseek-key required for narration (or set DEEPSEEK_API_KEY)", file=sys.stderr)
             sys.exit(1)
 
-        if story_context:
-            print(f"[narrate] story context: {len(story_context)} chars")
+        if args.resume and ps.is_complete("narrate"):
+            print("[narrate] resuming — already complete")
+            with open(narrated_storyboard_path) as f:
+                clustered = json.load(f)
+            storyboard = clustered
+            storyboard_path = narrated_storyboard_path
+        else:
+            if story_context:
+                print(f"[narrate] story context: {len(story_context)} chars")
 
+            from narrate import narrate_beats as do_narrate
+
+            ps.mark_running("narrate")
+            step_start = time.time()
+            print(f"[narrate_beats] start at {_ts()} ({len(clustered['scenes'])} beats)...")
+            clustered = do_narrate(
+                storyboard_path=clustered_storyboard_path,
+                output_path=narrated_storyboard_path,
+                api_key=args.deepseek_key,
+                analysis_path=analysis_json,
+                story_context=story_context,
+                force=False,  # narrate_beats skips beats that already have narratedText
+            )
+            print(f"[narrate_beats] done at {_ts()} — elapsed {_elapsed(step_start)}")
+            storyboard = clustered
+            storyboard_path = narrated_storyboard_path
+            _narrate_ran = True
+    else:
+        ps.mark_skipped("narrate", "--narrate not requested")
+
+    # Step 3b: Validate narration — every beat must have narratedText before TTS.
+    # Runs only when narration was executed this pass (not on resume-skip).
+    if _narrate_ran:
         from narrate import narrate_beats as do_narrate
 
-        step_start = time.time()
-        print(f"[narrate_beats] start at {_ts()} ({len(clustered['scenes'])} beats)...")
-        clustered = do_narrate(
-            storyboard_path=clustered_storyboard_path,
-            output_path=narrated_storyboard_path,
-            api_key=args.deepseek_key,
-            analysis_path=analysis_json,
-            story_context=story_context,
-            force=args.narrate_force,
-        )
-        print(f"[narrate_beats] done at {_ts()} — elapsed {_elapsed(step_start)}")
-        storyboard = clustered
-        storyboard_path = narrated_storyboard_path
-
-    # Step 3b: Validate narration — every beat must have narratedText before TTS
-    if args.narrate:
-        from narrate import narrate_beats as do_narrate
-        
         for retry in range(2):
             missing = [i for i, b in enumerate(clustered["scenes"]) if not b.get("narratedText")]
             if not missing:
                 break
-            
+
             if retry == 0:
-                # First retry: re-narrate everything
-                print(f"[validate] {len(missing)}/{len(clustered['scenes'])} beats missing narration → full re-narrate")
+                # First retry: fill only missing beats (force=False skips already-narrated)
+                print(f"[validate] {len(missing)}/{len(clustered['scenes'])} beats missing narration → filling gaps")
                 clustered = do_narrate(
                     storyboard_path=narrated_storyboard_path,
                     output_path=narrated_storyboard_path,
                     api_key=args.deepseek_key,
                     analysis_path=analysis_json,
                     story_context=story_context,
-                    force=True,
+                    force=False,
                 )
             else:
                 # Second retry: narrate only missing beats individually via LLM
@@ -735,96 +768,122 @@ def main():
                     beat = clustered["scenes"][idx]
                     pov = beat.get("povText", "").strip()
                     dialogue = beat.get("dialogue", "").strip()
-                    
+
                     pct = int(round(beat.get("startSec", 0) / max(b.get("endSec", 1) for b in clustered["scenes"]) * 100))
                     user_prompt = f"Beat to narrate:\n[Beat] pos={pct}% visual: {pov[:300]}"
                     if dialogue:
                         user_prompt += f" dialogue: {dialogue[:200]}"
-                    
+
                     result = _http_post(args.deepseek_key, [
                         {"role": "system", "content": NARRATE_BATCH_SYSTEM},
                         {"role": "user", "content": user_prompt},
                     ], max_tokens=100, temperature=0.5, timeout=60, thinking_enabled=False, json_mode=True)
-                    
+
                     narrations = _parse_batch_response(result, 1)
                     if narrations:
                         clustered["scenes"][idx]["narratedText"] = narrations[0].strip()
                         print(f"    beat {idx+1:02d}: {narrations[0][:60]}...")
-        
+
         missing = [i for i, b in enumerate(clustered["scenes"]) if not b.get("narratedText")]
         if missing:
             print(f"[error] {len(missing)} beats still without narration. Cannot proceed with TTS.", file=sys.stderr)
             print(f"  Beat indices: {missing}", file=sys.stderr)
             sys.exit(1)
-        
+
         storyboard = clustered
         storyboard_path = narrated_storyboard_path
+        ps.mark_complete("narrate", scene_count=len(clustered["scenes"]))
 
     # Step 4: TTS (enabled by default, use --no-tts to skip)
     _default_model_path = os.path.join(PROJECT_ROOT, "models", "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16")
     _qwen3_model_path = args.tts_model if args.tts_model else _default_model_path
     if not args.no_tts:
-        from tts import generate_batch
-
         _is_local = os.path.exists(_qwen3_model_path) or _qwen3_model_path.startswith(("/", "."))
         if _is_local and not os.path.exists(_qwen3_model_path):
             print(f"[error] Qwen3 model not found at {_qwen3_model_path!r}. "
                   f"Download it to the models/ directory.", file=sys.stderr)
             sys.exit(1)
 
-        from voices import resolve_voice_instruct, get_voice_instruct
-        _genre_arg = args.genre
-        if _genre_arg == "auto":
-            if story_context and args.deepseek_key:
-                print(f"[voice] auto-detecting genres from story context...")
-                _instruct, _genres = resolve_voice_instruct(story_context, args.deepseek_key)
-                print(f"[voice] detected genres: {_genres}")
-                if len(_genres) > 1:
-                    print(f"[voice] blending {len(_genres)} genre presets → custom instruct")
-            else:
-                _genres = ["documentary"]
-                _instruct = get_voice_instruct("documentary")
+        if args.resume and ps.is_complete("tts") and os.path.exists(tts_storyboard_path):
+            print("[tts] resuming — already complete")
+            with open(tts_storyboard_path) as f:
+                storyboard = json.load(f)
+            storyboard_path = tts_storyboard_path
+            # Ensure window fields are set (they're in the checkpoint but re-confirm)
+            for i, scene in enumerate(storyboard["scenes"]):
+                scene.setdefault("window", i + 1)
         else:
-            _genres = [_genre_arg]
-            _instruct = get_voice_instruct(_genre_arg)
-            print(f"[voice] using genre preset: {_genre_arg}")
-        storyboard.setdefault("metadata", {})["voice_genres"] = _genres
-        storyboard["metadata"]["voice_instruct"] = _instruct
+            from tts import generate_batch
+            from voices import resolve_voice_instruct, get_voice_instruct
+            _genre_arg = args.genre
+            if _genre_arg == "auto":
+                if story_context and args.deepseek_key:
+                    print(f"[voice] auto-detecting genres from story context...")
+                    _instruct, _genres = resolve_voice_instruct(story_context, args.deepseek_key)
+                    print(f"[voice] detected genres: {_genres}")
+                    if len(_genres) > 1:
+                        print(f"[voice] blending {len(_genres)} genre presets → custom instruct")
+                else:
+                    _genres = ["documentary"]
+                    _instruct = get_voice_instruct("documentary")
+            else:
+                _genres = [_genre_arg]
+                _instruct = get_voice_instruct(_genre_arg)
+                print(f"[voice] using genre preset: {_genre_arg}")
+            storyboard.setdefault("metadata", {})["voice_genres"] = _genres
+            storyboard["metadata"]["voice_instruct"] = _instruct
 
-        tts_kwargs: dict = {
-            "model_path": _qwen3_model_path,
-            "speed": args.qwen3_speed,
-            "instruct": _instruct,
-        }
-        if args.deepseek_key:
-            tts_kwargs["api_key"] = args.deepseek_key
+            tts_kwargs: dict = {
+                "model_path": _qwen3_model_path,
+                "speed": args.qwen3_speed,
+                "instruct": _instruct,
+            }
+            if args.deepseek_key:
+                tts_kwargs["api_key"] = args.deepseek_key
 
-        step_start = time.time()
-        print(f"[tts] start at {_ts()}...")
-        generate_batch(storyboard["scenes"], voiceover_dir, **tts_kwargs)
-        print(f"[tts] done at {_ts()} — elapsed {_elapsed(step_start)}")
+            ps.mark_running("tts")
+            step_start = time.time()
+            print(f"[tts] start at {_ts()}...")
+            generate_batch(storyboard["scenes"], voiceover_dir, **tts_kwargs)
+            print(f"[tts] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
-        # Beats produced by cluster.py have no `window` field. Assign window=i+1
-        # so `adjust_display_frames_to_audio` (and downstream Zod validation) can
-        # locate each beat's `scene_NN.mp3` file.
-        for i, scene in enumerate(storyboard["scenes"]):
-            scene.setdefault("window", i + 1)
+            # Beats produced by cluster.py have no `window` field. Assign window=i+1
+            # so `adjust_display_frames_to_audio` (and downstream Zod validation) can
+            # locate each beat's `scene_NN.mp3` file.
+            for i, scene in enumerate(storyboard["scenes"]):
+                scene.setdefault("window", i + 1)
 
-        # Final sync guard: clamp each beat's displayFrames to its actual TTS
-        # audio duration + 0.4s padding so visuals end with the narration.
-        adjust_display_frames_to_audio(storyboard, voiceover_dir, args.fps)
+            # Final sync guard: clamp each beat's displayFrames to its actual TTS
+            # audio duration + 0.4s padding so visuals end with the narration.
+            adjust_display_frames_to_audio(storyboard, voiceover_dir, args.fps)
+
+            # Persist checkpoint before align so a crash in align can resume from here.
+            atomic_write_json(tts_storyboard_path, storyboard)
+            atomic_write_json(storyboard_path, storyboard)
+            storyboard_path = tts_storyboard_path
+            ps.mark_complete("tts")
+            print(f"[tts] storyboard with ttsText → {tts_storyboard_path}")
 
         # Step 4b: Align scene cuts to narration phrases via STT (per beat).
         # Replaces the placeholder/cluster-based segments with phrase-aligned
         # ones whose timing comes from word-level Whisper timestamps.
         if not args.no_align:
             if not args.deepseek_key:
+                ps.mark_skipped("align", "no deepseek key")
                 print("[align] skipping — DeepSeek key required for phrase matching (or pass --no-align)")
+            elif args.resume and ps.is_complete("align"):
+                print("[align] resuming — already complete")
+                # segments are already in storyboard loaded from tts_storyboard_path
             else:
                 from align import align_beats
 
+                ps.mark_running("align")
                 step_start = time.time()
                 print(f"[align] start at {_ts()}...")
+
+                def _align_progress(i: int, beat: dict) -> None:
+                    atomic_write_json(tts_storyboard_path, storyboard)
+
                 align_beats(
                     storyboard["scenes"],
                     source_scenes=source_scenes_pool,
@@ -833,126 +892,148 @@ def main():
                     fps=args.fps,
                     expand=args.align_expand,
                     whisper_model_size=args.align_whisper_model,
+                    on_progress=_align_progress,
                 )
+                # Final persist with complete alignment data
+                atomic_write_json(tts_storyboard_path, storyboard)
+                atomic_write_json(storyboard_path, storyboard)
+                ps.mark_complete("align")
                 print(f"[align] done at {_ts()} — elapsed {_elapsed(step_start)}")
+        else:
+            ps.mark_skipped("align", "--no-align")
+    else:
+        ps.mark_skipped("tts", "--no-tts")
+        ps.mark_skipped("align", "--no-tts")
 
-        # Persist ttsText (stamped in-place by generate_batch) plus the adjusted
-        # display frames. Re-write storyboard_path too so the render-prep block
-        # below picks up the synced durations when it reloads from disk.
-        with open(tts_storyboard_path, "w") as f:
-            json.dump(storyboard, f, indent=2)
-        with open(storyboard_path, "w") as f:
-            json.dump(storyboard, f, indent=2)
-        print(f"[tts] storyboard with ttsText → {tts_storyboard_path}")
-
-    # Step 4d: Build channel greeting beat (prepended before intro)
+    # Step 4d: Build channel greeting beat (prepended before render)
     if not args.no_greeting:
         from greeting import build_greeting_beat, DEFAULT_GREETING
 
+        _greeting_text = args.greeting_text or DEFAULT_GREETING
         greeting_mp3 = os.path.join(voiceover_dir, "scene_00.mp3")
-        if os.path.exists(greeting_mp3):
-            print(f"[greeting] scene_00.mp3 exists — skipping TTS")
-            import subprocess as _sp
-            try:
-                _r = _sp.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", greeting_mp3],
-                    capture_output=True, text=True, timeout=15,
-                )
-                _audio_secs = float(_r.stdout.strip())
-                _padding_frames = 15
-                _display_frames = max(int((_audio_secs + _padding_frames / args.fps) * args.fps), args.fps * 3)
-                from greeting import CHANNEL_NAME
-                greeting_beat = {
-                    "isGreeting": True, "window": 0,
-                    "startSec": 0.0, "endSec": round(_display_frames / args.fps, 3),
-                    "durationInFrames": _display_frames, "displayFrames": _display_frames,
-                    "povText": f"[GREETING] {args.greeting_text or DEFAULT_GREETING}",
-                    "narratedText": args.greeting_text or DEFAULT_GREETING,
-                    "dialogue": "", "startFmt": "00:00:00",
-                    "segments": [], "channelName": CHANNEL_NAME,
-                }
-            except Exception as _e:
-                print(f"[greeting] ffprobe failed ({_e}), re-generating")
-                greeting_beat = None
+
+        if args.resume and ps.is_complete("greeting"):
+            print("[greeting] resuming — already complete")
+            # greeting beat is already at index 0 in storyboard (in the tts_storyboard_path checkpoint)
         else:
+            ps.mark_running("greeting")
             greeting_beat = None
 
-        if greeting_beat is None:
-            step_start = time.time()
-            greeting_beat = build_greeting_beat(
-                fps=args.fps,
-                voiceover_dir=voiceover_dir,
-                model_path=_qwen3_model_path,
-                greeting_text=args.greeting_text or DEFAULT_GREETING,
-                tts_speed=args.qwen3_speed,
-            )
-            print(f"[greeting] done at {_ts()} — elapsed {_elapsed(step_start)}")
+            # Reuse existing scene_00.mp3 only when it was generated for the same greeting text.
+            _greeting_state = ps._state.get("greeting", {})
+            _stored_text = _greeting_state.get("greeting_text")
+            if os.path.exists(greeting_mp3) and _stored_text == _greeting_text:
+                _dur = probe_audio(greeting_mp3)
+                if _dur and _dur > 0.3:
+                    print(f"[greeting] scene_00.mp3 exists ({_dur:.1f}s) — reusing")
+                    _padding_frames = 15
+                    _display_frames = max(int((_dur + _padding_frames / args.fps) * args.fps), args.fps * 3)
+                    from greeting import CHANNEL_NAME
+                    greeting_beat = {
+                        "isGreeting": True, "window": 0,
+                        "startSec": 0.0, "endSec": round(_display_frames / args.fps, 3),
+                        "durationInFrames": _display_frames, "displayFrames": _display_frames,
+                        "povText": f"[GREETING] {_greeting_text}",
+                        "narratedText": _greeting_text,
+                        "dialogue": "", "startFmt": "00:00:00",
+                        "segments": [], "channelName": CHANNEL_NAME,
+                    }
 
-        storyboard["scenes"].insert(0, greeting_beat)
-        with open(storyboard_path, "w") as f:
-            json.dump(storyboard, f, indent=2)
-        print(f"[greeting] beat prepended → window=0, {greeting_beat['displayFrames']} frames")
+            if greeting_beat is None:
+                step_start = time.time()
+                greeting_beat = build_greeting_beat(
+                    fps=args.fps,
+                    voiceover_dir=voiceover_dir,
+                    model_path=_qwen3_model_path,
+                    greeting_text=_greeting_text,
+                    tts_speed=args.qwen3_speed,
+                )
+                print(f"[greeting] done at {_ts()} — elapsed {_elapsed(step_start)}")
+
+            storyboard["scenes"].insert(0, greeting_beat)
+            atomic_write_json(storyboard_path, storyboard)
+            ps.mark_complete("greeting", greeting_text=_greeting_text)
+            print(f"[greeting] beat prepended → window=0, {greeting_beat['displayFrames']} frames")
+    else:
+        ps.mark_skipped("greeting", "--no-greeting")
 
     # Step 5: Place video + voiceovers in remotion/public/
-    setup_remotion_public(video_path, voiceover_dir=voiceover_dir)
+    setup_remotion_public(video_path, voiceover_dir=voiceover_dir if not args.no_tts else None)
 
     # Also copy latest storyboard for Remotion Studio preview (auto-load in Root.tsx)
     studio_sb_path = os.path.join(REMOTION_DIR, "src", "latest_storyboard.json")
-    with open(studio_sb_path, "w") as f:
-        json.dump(storyboard, f, indent=2)
+    atomic_write_json(studio_sb_path, storyboard)
     print(f"[setup] storyboard → remotion/src/latest_storyboard.json")
 
-    # Step 5b: Prepare beats for Remotion render (add window field for Zod validation)
-    if os.path.exists(clustered_storyboard_path):
-        with open(storyboard_path) as f:
-            render_storyboard = json.load(f)
-        for i, beat in enumerate(render_storyboard["scenes"]):
-            # Greeting beat has window=0; regular beats have window already set in Step 4.
-            # Use existing window if present, fall back to i+1 for non-greeting beats.
-            w = beat.get("window", 0 if beat.get("isGreeting") else i)
-            vo_path = f"voiceover/scene_{w:02d}.mp3"
-            real_path = os.path.join(run_dir, vo_path)
-            if os.path.exists(real_path):
-                beat["voiceoverPath"] = vo_path
-            # Ensure required fields for Zod: window, endSec, durationInFrames, startFmt
-            beat["window"] = w
-            beat["endSec"] = beat.get("endSec", beat.get("startSec", 0) + beat.get("displayFrames", 30) / args.fps)
-            beat["durationInFrames"] = beat.get("durationInFrames", beat.get("displayFrames", 30))
-            beat["startFmt"] = beat.get("startFmt", "")
-            beat["dialog"] = beat.get("dialogue", "")
-        print(f"[render] rendering {len(render_storyboard['scenes'])} beats")
+    # Step 5b: Prepare beats for Remotion render (add window field for Zod validation).
+    # Always re-derives render_storyboard from the current storyboard (cheap).
+    with open(storyboard_path) as f:
+        render_storyboard = json.load(f)
+    for i, beat in enumerate(render_storyboard["scenes"]):
+        # Greeting beat has window=0; regular beats have window already set in Step 4.
+        w = beat.get("window", 0 if beat.get("isGreeting") else i)
+        vo_path = f"voiceover/scene_{w:02d}.mp3"
+        real_path = os.path.join(run_dir, vo_path)
+        if os.path.exists(real_path):
+            beat["voiceoverPath"] = vo_path
+        beat["window"] = w
+        beat["endSec"] = beat.get("endSec", beat.get("startSec", 0) + beat.get("displayFrames", 30) / args.fps)
+        beat["durationInFrames"] = beat.get("durationInFrames", beat.get("displayFrames", 30))
+        beat["startFmt"] = beat.get("startFmt", "")
+        beat["dialog"] = beat.get("dialogue", "")
+    print(f"[render] {len(render_storyboard['scenes'])} beats prepared")
 
     # Step 6: Install Node deps
     install_remotion_deps()
 
     # Step 7: Render
-    step_start = time.time()
-    print(f"[render] start at {_ts()}...")
-    run_render(render_storyboard, output_mp4, concurrency=args.concurrency, gl=args.gl)
-    print(f"[render] done at {_ts()} — elapsed {_elapsed(step_start)}")
-
-    # Step 8: Generate Premiere Pro XML/EDL for editing
-    step_start = time.time()
-    print(f"[premiere] generating XML/EDL...")
-    xml_path = os.path.join(run_dir, f"{run_name}_premiere.xml")
-    edl_path = os.path.join(run_dir, f"{run_name}_premiere.edl")
-    generate_premiere_xml(render_storyboard, xml_path, video_path, project_name=run_name)
-    generate_premiere_edl(render_storyboard, edl_path, project_name=run_name)
-    print(f"[premiere] XML → {xml_path}")
-    print(f"[premiere] EDL → {edl_path}")
-    print(f"[premiere] done at {_ts()} — elapsed {_elapsed(step_start)}")
+    # Skip if complete AND output is newer than the storyboard checkpoint (not stale).
+    _render_stale = (
+        os.path.exists(output_mp4)
+        and os.path.exists(storyboard_path)
+        and os.path.getmtime(storyboard_path) > os.path.getmtime(output_mp4)
+    )
+    if args.resume and ps.is_complete("render") and not _render_stale:
+        print(f"[render] resuming — already complete: {output_mp4}")
+    else:
+        if _render_stale:
+            print("[render] storyboard is newer than output — re-rendering")
+        ps.mark_running("render")
+        step_start = time.time()
+        print(f"[render] start at {_ts()}...")
+        run_render(render_storyboard, output_mp4, concurrency=args.concurrency, gl=args.gl)
+        ps.mark_complete("render")
+        print(f"[render] done at {_ts()} — elapsed {_elapsed(step_start)}")
 
     pipeline_elapsed = _elapsed(pipeline_start)
     print(f"\n{'='*60}")
-    print(f"[pipeline] ALL DONE at {_ts()} — total elapsed {pipeline_elapsed}")
+    print(f"[pipeline] render done at {_ts()} — total elapsed {pipeline_elapsed}")
     print(f"[pipeline] output → {output_mp4}")
     print(f"{'='*60}")
 
+    # Step 8: Generate Premiere Pro XML/EDL for editing
+    xml_path = os.path.join(run_dir, f"{run_name}_premiere.xml")
+    edl_path = os.path.join(run_dir, f"{run_name}_premiere.edl")
+    if args.resume and ps.is_complete("premiere") and os.path.exists(xml_path):
+        print("[premiere] resuming — already complete")
+    else:
+        ps.mark_running("premiere")
+        step_start = time.time()
+        print(f"[premiere] generating XML/EDL...")
+        generate_premiere_xml(render_storyboard, xml_path, video_path, project_name=run_name)
+        generate_premiere_edl(render_storyboard, edl_path, project_name=run_name)
+        ps.mark_complete("premiere")
+        print(f"[premiere] XML → {xml_path}")
+        print(f"[premiere] EDL → {edl_path}")
+        print(f"[premiere] done at {_ts()} — elapsed {_elapsed(step_start)}")
+
     # Step 9: Generate YouTube metadata (title, description, hashtags)
-    if args.deepseek_key:
+    meta_path = os.path.join(run_dir, f"{run_name}_metadata.md")
+    if args.resume and ps.is_complete("metadata") and os.path.exists(meta_path):
+        print("[metadata] resuming — already complete")
+    elif args.deepseek_key:
         from metadata_gen import generate_video_metadata
-        meta_path = os.path.join(run_dir, f"{run_name}_metadata.md")
+        ps.mark_running("metadata")
         try:
             generate_video_metadata(
                 storyboard=render_storyboard,
@@ -961,9 +1042,11 @@ def main():
                 story_context=story_context or "",
                 output_path=meta_path,
             )
+            ps.mark_complete("metadata")
         except Exception as e:
             print(f"[metadata] failed: {e}", file=sys.stderr)
     else:
+        ps.mark_skipped("metadata", "no deepseek key")
         print("[metadata] skipped — no DeepSeek key (pass --deepseek-key to generate)")
 
     # Optional: downscale to target height
@@ -998,7 +1081,7 @@ def main():
         "run_dir": run_dir,
         "fps": args.fps,
         "recap_ratio": args.recap_ratio,
-        "tts": "qwen3" if not args.no_tts else None,
+        "tts": "qwen3" if ps.is_complete("tts") else None,
         "narrate": args.narrate,
         "scene_count": len(storyboard.get("scenes", [])),
         "metadata": sb_meta,
