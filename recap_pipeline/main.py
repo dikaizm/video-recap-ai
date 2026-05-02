@@ -365,21 +365,22 @@ def run_render(storyboard: dict, output_mp4: str, concurrency: int | None = None
 PIPELINE_STEPS = [
     "analysis", "transform", "cluster", "intro",
     "narrate", "tts", "align", "greeting",
-    "render", "premiere", "metadata",
+    "render", "premiere", "metadata", "thumbnail",
 ]
 
 DOWNSTREAM: dict[str, list[str]] = {
-    "analysis":  ["transform", "cluster", "intro", "narrate", "tts", "align", "greeting", "render", "premiere", "metadata"],
-    "transform": ["cluster", "intro", "narrate", "tts", "align", "greeting", "render", "premiere", "metadata"],
-    "cluster":   ["intro", "narrate", "tts", "align", "greeting", "render", "premiere", "metadata"],
-    "intro":     ["narrate", "tts", "align", "greeting", "render", "premiere", "metadata"],
-    "narrate":   ["tts", "align", "greeting", "render", "premiere", "metadata"],
-    "tts":       ["align", "greeting", "render", "premiere", "metadata"],
-    "align":     ["greeting", "render", "premiere", "metadata"],
-    "greeting":  ["render", "premiere", "metadata"],
-    "render":    ["premiere", "metadata"],
-    "premiere":  ["metadata"],
-    "metadata":  [],
+    "analysis":  ["transform", "cluster", "intro", "narrate", "tts", "align", "greeting", "render", "premiere", "metadata", "thumbnail"],
+    "transform": ["cluster", "intro", "narrate", "tts", "align", "greeting", "render", "premiere", "metadata", "thumbnail"],
+    "cluster":   ["intro", "narrate", "tts", "align", "greeting", "render", "premiere", "metadata", "thumbnail"],
+    "intro":     ["narrate", "tts", "align", "greeting", "render", "premiere", "metadata", "thumbnail"],
+    "narrate":   ["tts", "align", "greeting", "render", "premiere", "metadata", "thumbnail"],
+    "tts":       ["align", "greeting", "render", "premiere", "metadata", "thumbnail"],
+    "align":     ["greeting", "render", "premiere", "metadata", "thumbnail"],
+    "greeting":  ["render", "premiere", "metadata", "thumbnail"],
+    "render":    ["premiere", "metadata", "thumbnail"],
+    "premiere":  ["metadata", "thumbnail"],
+    "metadata":  ["thumbnail"],
+    "thumbnail": [],
 }
 
 
@@ -452,6 +453,7 @@ def main():
         help=f"Minimum fraction of scenes that must have VLM descriptions (default: {VLM_MIN_DESCRIPTION_RATIO}). Set to 0 to disable.",
     )
     parser.add_argument("--no-evaluate", action="store_true", help="Skip story coherence evaluation after narration")
+    parser.add_argument("--no-thumbnail", action="store_true", help="Skip YouTube thumbnail generation (Step 10)")
     parser.add_argument("--concurrency", type=int, default=None,
                         help="Remotion render concurrency (default: half of CPU cores, max 8)")
     parser.add_argument("--gl", default="angle",
@@ -1048,6 +1050,34 @@ def main():
     else:
         ps.mark_skipped("metadata", "no deepseek key")
         print("[metadata] skipped — no DeepSeek key (pass --deepseek-key to generate)")
+
+    # Step 10: Generate YouTube thumbnail
+    thumb_path = os.path.join(run_dir, f"{run_name}_thumbnail.jpg")
+    if args.no_thumbnail:
+        ps.mark_skipped("thumbnail", "--no-thumbnail")
+        print("[thumbnail] skipped — --no-thumbnail")
+    elif args.resume and ps.is_complete("thumbnail") and os.path.exists(thumb_path):
+        print("[thumbnail] resuming — already complete")
+    else:
+        from thumbnail import generate_thumbnail as _gen_thumbnail
+        ps.mark_running("thumbnail")
+        step_start = time.time()
+        print(f"[thumbnail] start at {_ts()}...")
+        try:
+            _gen_thumbnail(
+                video_path=video_path,
+                analysis_path=analysis_json,
+                narrated_storyboard_path=narrated_storyboard_path,
+                run_dir=run_dir,
+                movie_title=run_name.replace("-", " ").replace("_", " "),
+                api_key=args.deepseek_key,
+                output_filename=f"{run_name}_thumbnail.jpg",
+            )
+            ps.mark_complete("thumbnail")
+            print(f"[thumbnail] done at {_ts()} — elapsed {_elapsed(step_start)}")
+        except Exception as e:
+            print(f"[thumbnail] failed: {e}", file=sys.stderr)
+            ps.mark_skipped("thumbnail", f"error: {e}")
 
     # Optional: downscale to target height
     if args.render_height:
