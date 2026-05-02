@@ -61,7 +61,7 @@ Otherwise (the frames show actual story content with characters or action), outp
 {
   "location": "interior or exterior, describe the setting from the frames",
   "characters": "who is visible — describe clothing, build, and visible features ONLY. NEVER state or infer gender unless a face is clearly visible and unambiguous. Use 'person' or 'figure' when gender is uncertain. NEVER write 'male', 'female', 'man', 'woman', 'he', 'she' unless you are certain from clear facial features.",
-  "action": "what is literally happening in the frames",
+  "action": "what the characters are physically doing — use subject-verb phrasing. If no characters are present, describe the scene movement.",
   "dialogue": "only if dialogue is provided — what is said and by whom",
   "key_objects": "specific objects visible in the frames",
   "mood": "the visual atmosphere — lighting, color, composition",
@@ -253,12 +253,14 @@ def iter_frame_windows(
     window_size: int,
     overlap: int,
     decode_height: int | None = None,
+    skip_windows: int = 0,
 ):
-    """Stream analysis windows one at a time — only window_size frames in memory at once."""
+    """Stream analysis windows one at a time — only window_size frames in memory at once.
+
+    skip_windows: seek past this many already-processed windows (for resume).
+    """
     container = av.open(video_path)
     stream = container.streams.video[0]
-    fps = float(stream.average_rate)
-    interval_frames = max(1, int(fps * interval_sec))
     step = max(1, window_size - overlap)
 
     # Compute reformat target — only downscale, never upscale
@@ -272,17 +274,28 @@ def iter_frame_windows(
             target_w = int(orig_w * scale) & ~1  # keep even for yuv420p
             target_h = decode_height
 
+    # When resuming, seek to the first frame of the target window.
+    # Window N starts at sampled-frame index N*step, i.e. time N*step*interval_sec.
+    seek_sec = skip_windows * step * interval_sec
+    if seek_sec > 0:
+        seek_pts = int(seek_sec / float(stream.time_base))
+        container.seek(seek_pts, stream=stream)
+
     buffer: list[tuple[float, Image.Image]] = []
-    window_idx = 0
+    window_idx = skip_windows
+    # Timestamp-based sampling: collect the next frame at/after next_sample_ts.
+    # This works correctly both from the start (seek_sec=0) and after a seek.
+    next_sample_ts = seek_sec
 
     try:
-        for i, frame in enumerate(container.decode(stream)):
-            if i % interval_frames != 0:
-                continue
+        for frame in container.decode(stream):
             ts = float(frame.pts * stream.time_base)
+            if ts < next_sample_ts - interval_sec * 0.1:
+                continue
             if target_w and target_h:
                 frame = frame.reformat(width=target_w, height=target_h)
             buffer.append((ts, frame.to_image()))
+            next_sample_ts = ts + interval_sec
 
             while len(buffer) >= window_size:
                 chunk = buffer[:window_size]
@@ -545,12 +558,58 @@ def main():
     decode_label = f" at {args.decode_height}p" if args.decode_height else ""
     print(f"Step 2/3 — Streaming frames{decode_label} → VLM ({args.ollama_model})...")
 
-    results = []
+    results: list[dict] = []
     prev_scene_history: list[str] = []
+    skip_windows = 0
+
+    # Resume: load partial results if the output file already exists
+    if output_path.exists():
+        try:
+            existing = json.loads(output_path.read_text())
+            existing_scenes = existing.get("scenes", [])
+            settings_match = (
+                existing.get("interval_sec") == args.interval
+                and existing.get("window_size") == args.window
+                and existing.get("overlap") == args.overlap
+                and existing.get("vlm_model") == args.ollama_model
+            )
+            if not settings_match:
+                print("[resume] settings changed — starting fresh")
+            elif existing_scenes:
+                results = existing_scenes
+                skip_windows = len(results)
+                if not args.no_continuity:
+                    for entry in results:
+                        if not entry.get("is_credits"):
+                            prev_scene_history.append(
+                                extract_prev_scene_summary(entry["description"])
+                            )
+                    prev_scene_history = prev_scene_history[-3:]
+                print(
+                    f"[resume] found {skip_windows} windows — resuming from window {skip_windows + 1}"
+                )
+        except Exception as e:
+            print(f"[resume] could not load existing output ({e}) — starting fresh")
+
+    # Static metadata written on every incremental save
+    _output_meta = {
+        "video": str(video_path),
+        "vlm_model": args.ollama_model,
+        "vlm_backend": "ollama",
+        "ollama_host": args.ollama_host,
+        "transcriber": None if args.no_audio else args.transcriber,
+        "whisper_model": None if args.no_audio else args.whisper_model,
+        "interval_sec": args.interval,
+        "window_size": args.window,
+        "overlap": args.overlap,
+        "context": args.context,
+        "decode_height": args.decode_height,
+    }
 
     for idx, start_ts, end_ts, window_frames in iter_frame_windows(
         str(video_path), args.interval, args.window, args.overlap,
         decode_height=args.decode_height,
+        skip_windows=skip_windows,
     ):
         start_fmt = format_timestamp(start_ts)
         end_fmt = format_timestamp(end_ts)
@@ -612,7 +671,16 @@ def main():
             "vlm_data": parsed_data if parsed_data else None,
         }
         results.append(entry)
-    
+
+        # Incremental save so a crash/interrupt can be resumed
+        _partial = {
+            **_output_meta,
+            "total_windows": len(results),
+            "processing_sec": round(time.time() - pipeline_start, 1),
+            "scenes": results,
+        }
+        output_path.write_text(json.dumps(_partial, indent=2, ensure_ascii=False))
+
     # Wait for transcription to complete if still running
     if transcript_future:
         print("\nWaiting for transcription to complete...")
